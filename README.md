@@ -38,6 +38,8 @@ Built on [kepyur](https://github.com/gilankpam/kepyur), which does the radio and
   160 MB/s, so plan on at most about two adapters per USB 3 controller.
 - Windows 10 or 11, 64-bit, with the Microsoft Edge WebView2 Runtime (part of Windows 11 and most Windows 10 PCs).
 
+- Tested with Cudy AC1300 - UK Amazon (No affiliate link) https://www.amazon.co.uk/dp/B084DNWSXK
+
 ## Install
 
 1. Download `PlayRX-Setup-<version>.exe` from [Releases](../../releases).
