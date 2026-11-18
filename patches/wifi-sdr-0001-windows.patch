@@ -1,0 +1,147 @@
+diff --git a/src/receiver.cpp b/src/receiver.cpp
+index af47d55..5c0c686 100644
+--- a/src/receiver.cpp
++++ b/src/receiver.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <tuple>
+ 
+@@ -87,7 +88,7 @@ void Receiver::open(uint16_t pid, const RxSettings &initial, int bus, const std:
+   if (sys_fd >= 0)
+     o.reset = false; // a USB reset can re-enumerate the device and invalidate the granted fd
+   o.bw = cu && !initial.allow_gapped ? 20 : width_of(initial, cu); // 8812CU at 40 MS/s only gapped
+-  o.channel = channel_for(initial.freq, o.bw);
++  o.channel = channel_for(initial.centre > 0 ? initial.centre : initial.freq, o.bw);
+   o.thermal_track = false; // no host register traffic while streaming
+   auto s = std::make_unique<Session>(_log);
+   try {
+@@ -171,7 +172,7 @@ void Receiver::set(const RxSettings &s) {
+     n.gain_db = std::clamp(n.gain_db, 0.0, _caps.gain_max);
+     const auto hw = [&](const RxSettings &x) {
+       const int w = width_of(x, _caps.cu);
+-      return std::make_tuple(channel_for(x.freq, w), w, x.rate_sel, x.agc, x.agc ? 0 : igi_for(x.gain_db, _caps.cu));
++      return std::make_tuple(channel_for(x.centre > 0 ? x.centre : x.freq, w), w, x.rate_sel, x.agc, x.agc ? 0 : igi_for(x.gain_db, _caps.cu));
+     };
+     const bool same_hw = hw(n) == hw(_set);
+     _set = n;
+@@ -230,7 +231,7 @@ void Receiver::worker() {
+       _st.state = RxState::Starting;
+     }
+     const int width = width_of(cur, _caps.cu);
+-    const int ch = channel_for(cur.freq, width);
++    const int ch = channel_for(cur.centre > 0 ? cur.centre : cur.freq, width);
+     const double fs = rate_of(cur.rate_sel);
+     const double centre = centre_of(ch, width);
+     try {
+@@ -257,6 +258,9 @@ void Receiver::worker() {
+     c.la.rate_sel = cur.rate_sel;
+     // >= 20 MS/s needs ~13 ms of posted URBs; the 8812CU wants ~100 ms (FINDINGS §4)
+     c.depth = _caps.cu || cur.rate_sel <= 2 ? 256 : 64;
++    // AnalogRX: WSDR_URB_DEPTH overrides the posted bulk-IN transfers (Windows tuning experiments)
++    if (const char *d = std::getenv("WSDR_URB_DEPTH"))
++      if (std::atoi(d) > 0) c.depth = std::min(4096, std::atoi(d));
+     c.la.igi = cur.agc ? -1 : igi_for(cur.gain_db, _caps.cu);
+     c.la.no_cca = !cur.agc;
+     c.la.dfir = !_caps.cu && width >= 40 ? width : 0; // 0 leaves devourer's DFIR (8822B: BW20 set; 8822C: per width)
+diff --git a/src/receiver.h b/src/receiver.h
+index 740bd8f..79a8132 100644
+--- a/src/receiver.h
++++ b/src/receiver.h
+@@ -46,6 +46,9 @@ inline uint16_t model_pid(uint16_t vid, uint16_t pid) {
+ 
+ struct RxSettings {
+   double freq = 5180e6; // requested centre
++  // AnalogRX: where to put the hardware centre instead (the channel nearest it); 0 = nearest freq. The bank's
++  // shift_hz is still freq - centre. Analog FM video must not sit on the chip's DC point (its DC filter eats it).
++  double centre = 0;
+   int rate_sel = 5;     // fs = 80 MHz >> rate_sel: 5 = 2.5, 4 = 5, 3 = 10, 2 = 20, 1 = 40 MS/s; 0 = 80 MS/s
+                         // (8812BU, gapped only: 80 MHz width + vendor BW80 RX DFIR, ~77 MHz at -6 dB)
+   bool wide = true;     // at 40 MS/s: 40 MHz channel width (8812BU: + vendor BW40 RX DFIR; 8822C: devourer's
+diff --git a/src/stream88xx.cpp b/src/stream88xx.cpp
+index a663615..d243daf 100644
+--- a/src/stream88xx.cpp
++++ b/src/stream88xx.cpp
+@@ -27,6 +27,7 @@ constexpr uint32_t kBankC2h[2] = {0x16000u, 0x06000u}; // TXFF 0x20000 / 0x30000
+ constexpr uint8_t kSentinel[8] = {0xE1, 0xF1, 0x47, 0x5E, 0xA5, 0xA5, 0xA5, 0xA5}; // stream8822b.S
+ 
+ constexpr unsigned kStartRetries = 2;
++constexpr uint32_t kStartGraceBanks = 4; // AnalogRX: late banks tolerated (dropped) at the start of a run
+ 
+ size_t chunk_off(int k) { return Stream8822b::kPrefix + static_cast<size_t>(k) * Stream8822b::kChunk; }
+ 
+@@ -161,6 +162,7 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+         break;
+       const int b = _c.gapped ? 0 : static_cast<int>(seq & 1);
+       int part = 0;
++      bool late_skip = false;
+       BankInfo bi;
+       bi.seq = seq;
+       bi.bank = b;
+@@ -200,6 +202,16 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+           rd.release();
+           continue;
+         }
++        // AnalogRX: the late start (above) overruns the next bank too; the chip then sends that bank's trailer
++        // early, one 16 KiB part short. Within the first banks of a run, drop the incomplete bank and go on.
++        if (part < 4 && seq < kStartGraceBanks && static_cast<size_t>(d.len) == 24 + kTrailerPayload &&
++            std::memcmp(d.data, trl_desc, 12) == 0) {
++          if (st.start_late_skips++ < 4)
++            std::fprintf(stderr, "stream: bank %u short (%d of 4 parts) at the start of the run, dropped\n", seq, part);
++          late_skip = true;
++          rd.release();
++          break;
++        }
+         const bool trailer = part == 4;
+         const uint8_t *want = trailer ? trl_desc : data_desc;
+         const size_t want_len = 24 + (trailer ? kTrailerPayload : kChunk);
+@@ -217,15 +229,31 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+           bi.late_us = static_cast<int32_t>(stamp[2] - stamp[1]) / 5.0;
+           bi.ship_us = static_cast<int32_t>(stamp[3] - stamp[2]) / 5.0;
+           bi.end_us = static_cast<int32_t>(stamp[3] - stamp[1]) / 5.0;
+-          if (!_c.gapped && bi.end_us * 5 > budget5) // gapped: the LA is stopped while a bank ships
+-            throw std::runtime_error("deadline: bank " + std::to_string(seq) + " ended " +
+-                                     std::to_string(bi.end_us) + " us after due");
++          if (!_c.gapped && bi.end_us * 5 > budget5) { // gapped: the LA is stopped while a bank ships
++            // AnalogRX: behind a USB hub the first bank of a run ships ~190 us late every time (the hub's
++            // downstream link waking up), and the run used to fail on it, restart, and fail again for ever.
++            // A late bank among the first few is dropped (its samples are partly overwritten); later ones
++            // still end the run as before.
++            if (seq < kStartGraceBanks) {
++              late_skip = true;
++              if (st.start_late_skips++ < 4)
++                std::fprintf(stderr, "stream: bank %u ended %.1f us after due at the start of the run, dropped\n",
++                             seq, bi.end_us);
++            } else {
++              throw std::runtime_error("deadline: bank " + std::to_string(seq) + " ended " +
++                                       std::to_string(bi.end_us) + " us after due");
++            }
++          }
+         }
+         rd.release();
+         part++;
+       }
+       if (stopped)
+         break;
++      if (late_skip) {  // AnalogRX: a late bank at the start of the run is not handed on (see above)
++        seen[b] = true;
++        continue;
++      }
+       // CPU-written windows: descriptors ([104,128) and the 24 bytes before chunks 1..3) and the
+       // sentinel in the last sample. In live data the ADC must have overwritten all of them.
+       uint8_t *tail = bank.data() + kBankBytes - 8;
+diff --git a/src/stream88xx.h b/src/stream88xx.h
+index 69c6cb3..108f60d 100644
+--- a/src/stream88xx.h
++++ b/src/stream88xx.h
+@@ -51,6 +51,7 @@ struct StreamStats {
+   unsigned stale = 0;
+   unsigned pattern_bad = 0;
+   unsigned start_retries = 0; // starts repeated because the first packet never came (issue #2)
++  unsigned start_late_skips = 0; // AnalogRX: late banks dropped at the start of a run (behind a USB hub)
+   double late_max_us = 0, ship_max_us = 0, end_max_us = 0;
+   double wall_s = 0;
+   std::string error;       // empty unless the stream stopped on a fault

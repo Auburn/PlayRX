@@ -1,0 +1,135 @@
+diff --git a/native/dsp/video.cpp b/native/dsp/video.cpp
+index 2ef8b67..8e0bdf1 100644
+--- a/native/dsp/video.cpp
++++ b/native/dsp/video.cpp
+@@ -5,7 +5,9 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <string>
+ 
+ #include "log.h"
+ 
+@@ -39,6 +41,15 @@ struct Biquad {  // RBJ low-pass
+     a1 = static_cast<float>(-2 * c / a0);
+     a2 = static_cast<float>((1 - al) / a0);
+   }
++  void bandpass(double fc, double fs, double q) {  // RBJ band-pass, 0 dB at fc
++    const double w = 2 * M_PI * fc / fs, c = std::cos(w), al = std::sin(w) / (2 * q);
++    const double a0 = 1 + al;
++    b0 = static_cast<float>(al / a0);
++    b1 = 0;
++    b2 = static_cast<float>(-al / a0);
++    a1 = static_cast<float>(-2 * c / a0);
++    a2 = static_cast<float>((1 - al) / a0);
++  }
+   void notch(double fc, double fs, double q) {
+     const double w = 2 * M_PI * fc / fs, c = std::cos(w), al = std::sin(w) / (2 * q);
+     const double a0 = 1 + al;
+@@ -71,6 +82,32 @@ public:
+     lp_luma.design(3.0e6, fs, 0.54);
+     lp_luma2.design(3.0e6, fs, 1.31);
+     lp_sync.design(1.0e6, fs);
++    // AnalogRX comb luma: one gentle section (Q 0.6: no peaking, ~1 % overshoot), -3 dB near 4 MHz
++    lp_wide.design(4.8e6, fs, 0.6);
++    wide_ring.assign(8192, 0);
++    comb_mode = o.luma_filter >= 0 ? o.luma_filter == 1 : [] {
++      const char *e = std::getenv("ARX_LUMA");
++      return !(e && std::string(e) == "classic");
++    }();
++    // colour/brightness registration: the classic chain was aligned by hand (0.21 us); the comb luma filter
++    // is faster, so colour must come that much later relative to it
++    {
++      auto delay = [](Biquad a, Biquad *b, Biquad *c) {  // group delay at low frequency: impulse centroid
++        double s = 0, sw = 0;
++        for (int i = 0; i < 2048; i++) {
++          float x = i == 0 ? 1.f : 0.f;
++          x = a.run(x);
++          if (b) x = b->run(x);
++          if (c) x = c->run(x);
++          s += x;
++          sw += x * static_cast<double>(i);
++        }
++        return s != 0 ? sw / s : 0;
++      };
++      Biquad l1 = lp_luma, l2 = lp_luma2;
++      const double classic = delay(l1, &l2, nullptr), comb = delay(lp_wide, nullptr, nullptr);
++      cdel_comb = 0.21e-6 * fs + (classic - comb);
++    }
+     acq.resize(static_cast<size_t>(fs * 0.06));  // 60 ms
+     hist.assign(800, 0);
+     set_std(o.std_force == 2 ? kPal : kNtsc);
+@@ -103,7 +140,24 @@ public:
+     const float m = std::max(std::min(med_a, med_b), std::min(std::max(med_a, med_b), s));
+     med_b = med_a;
+     med_a = s;
+-    luma_ring[n & ring_mask] = luma_notch.run(lp_luma2.run(lp_luma.run(d)));
++    if (comb_on) {
++      // AnalogRX: NTSC colour flips phase from one line to the next. Half the difference with the same point
++      // one line earlier (T samples, tracked) is colour plus vertical detail; band-passing it at the subcarrier
++      // leaves the colour, and the brightness is the wide signal minus that. No notch, so no ringing.
++      const float w = lp_wide.run(d);
++      wide_ring[n & ring_mask] = w;
++      float wp = w;
++      const double qpos = static_cast<double>(n) - T;
++      if (qpos > 1) {
++        const int64_t q0 = static_cast<int64_t>(qpos);
++        const float fr = static_cast<float>(qpos - q0);
++        const float a = wide_ring[q0 & ring_mask], b = wide_ring[(q0 + 1) & ring_mask];
++        wp = a + (b - a) * fr;
++      }
++      luma_ring[n & ring_mask] = w - bp_chroma.run(0.5f * (w - wp));
++    } else {
++      luma_ring[n & ring_mask] = luma_notch.run(lp_luma2.run(lp_luma.run(d)));
++    }
+     if (o.colour) {
+       // the oscillator's phase belongs to the absolute sample index: burst and picture share it
+       const cf c = d * std::conj(lo);
+@@ -175,6 +229,11 @@ private:
+   std::vector<cf> prev_uv;         // PAL-D: the previous line's U/V
+   float med_a = 0, med_b = 0;
+   Biquad lp_luma, lp_luma2, lp_sync;
++  // AnalogRX comb luma (DecoderOpts::luma_filter)
++  Biquad lp_wide, bp_chroma;
++  std::vector<float> wide_ring;
++  bool comb_mode = true, comb_on = false;
++  double cdel_comb = 0;
+   bool low = false, longrun = false;
+   uint64_t low_start = 0;
+   double T = 0, line_start = -1;
+@@ -220,6 +279,8 @@ private:
+     const double a = 2 * M_PI * fsc / fs;
+     lo_step = cf(static_cast<float>(std::cos(a)), static_cast<float>(std::sin(a)));
+     luma_notch.notch(fsc, fs, 1.5);  // the subcarrier out of the picture (also the B/W herringbone)
++    bp_chroma.bandpass(fsc, fs, 1.0);  // comb: the colour band of the line difference
++    comb_on = comb_mode && &s == &kNtsc;  // PAL's colour needs a two-line comb: notch for now
+     prev_uv.assign(o.width, cf{});
+     colour_on = false;
+     c_good = 0;
+@@ -463,7 +524,7 @@ private:
+     // demodulated chroma comes out as -(U + jV)/2 against a burst of +1/2 (see fpv_sim.py's composite())
+     const float k_uv = 0.215f / std::max(c_mag, 1e-6f);
+     const cf rot = std::polar(1.f, static_cast<float>(-c_phase));
+-    const double cdel = 0.21e-6 * fs;  // chroma filter delay minus luma filter delay
++    const double cdel = comb_on ? cdel_comb : 0.21e-6 * fs;  // chroma filter delay minus luma filter delay
+     const bool pal = std_ == &kPal;
+     for (int x = 0; x < o.width; x++) {
+       const double p = ls + a0 + aw * x / o.width;
+diff --git a/native/dsp/video.h b/native/dsp/video.h
+index 4a4f6be..99fcd06 100644
+--- a/native/dsp/video.h
++++ b/native/dsp/video.h
+@@ -53,6 +53,11 @@ struct DecoderOpts {
+   int std_force = 0;           // 0 auto, 1 NTSC, 2 PAL
+   bool force_invert = false;   // only try sync at the high-frequency end
+   bool colour = true;          // decode colour (falls back to grey when there is no usable burst)
++  // AnalogRX: how colour is kept out of the picture's brightness (NTSC; PAL always uses the notch).
++  //  0 = classic: 3 MHz 4th-order low-pass + a notch at the subcarrier (rings ~4 px after every edge)
++  //  1 = comb: a gentle 4.8 MHz low-pass, colour cancelled with the line before (no ringing, sharper)
++  // -1 = from the environment, ARX_LUMA=classic|comb (default comb)
++  int luma_filter = -1;
+ };
+ 
+ class Decoder;

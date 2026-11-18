@@ -1,0 +1,261 @@
+--- a/native/dsp/video.cpp
++++ b/native/dsp/video.cpp
+@@ -2,6 +2,8 @@
+ // real R4 NTSC VTX: 93-96 % of lines locked); changes are marked "kepyur:".
+ #include "video.h"
+ 
++#include <atomic>
++
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+@@ -74,6 +76,7 @@
+ public:
+   Decoder(double fs, FrameSink sink, const DecoderOpts &o) : fs(fs), sink(std::move(sink)), o(o) {
+     luma_ring.assign(8192, 0);
++    bad_ring.assign(8192, 0);
+     chroma_ring.assign(8192, cf{});
+     ring_mask = 8191;
+     // chroma: mixed down by the subcarrier, 4th-order Butterworth low-pass at 1.2 MHz (U/V bandwidth)
+@@ -131,10 +134,13 @@
+     s.rephases = rephases;
+     s.colour = colour_on;
+     s.burst_err = c_err;
++    s.clicks_repaired = clicks_repaired;
++    s.lines_kept = lines_kept;
+     return s;
+   }
+ 
+-  inline void push(float d) {
++  inline void push(float d, uint8_t bad = 0) {
++    bad_ring[n & ring_mask] = bad;  // AnalogRX sparkle repair
+     // sync path: 5 MHz LP + 3-point median; luma path: 3 MHz LP (two sections)
+     const float s = lp_sync.run(d);
+     const float m = std::max(std::min(med_a, med_b), std::min(std::max(med_a, med_b), s));
+@@ -239,6 +245,11 @@
+   double T = 0, line_start = -1;
+   uint64_t lines = 0, lines_locked = 0, line_idx = 0, acquisitions = 0, losses = 0;
+   uint64_t line_low = 0;
++  std::vector<uint8_t> bad_ring;         // AnalogRX sparkle repair: the front end's click marks, like luma_ring
++  int64_t bad_from = -1;                 // first of the badly hit rows waiting for a good row below
++  uint64_t mend_field = ~0ull;
++  int mend_cur = -1;
++  uint64_t clicks_repaired = 0, lines_kept = 0;  // lines_kept: rows mended from their neighbours
+   bool line_has_longrun = false;
+   uint64_t line_longrun_start = 0;
+   bool prev_line_vsync = false;
+@@ -514,6 +525,8 @@
+     const int64_t k = static_cast<int64_t>(line_idx) - field_line0 - std_->skip;
+     if (k < 0 || k >= std_->active) return;
+     if (locked_line) measure_levels(ls);
++    const bool rep = repair_on();
++    const bool hit = rep && patch_line(ls);  // AnalogRX sparkle repair: clicks patched; true = still badly hit
+     bool pal_v = false;
+     const bool col = o.colour && locked_line && burst(ls, pal_v);
+     uint32_t *row = reinterpret_cast<uint32_t *>((cur_field == 0 ? fieldA : fieldB).data()) + static_cast<size_t>(k) * o.width;
+@@ -559,6 +572,73 @@
+       const auto q = [](float z) { return static_cast<uint32_t>(std::clamp(z * 255.f, 0.f, 255.f)); };
+       row[x] = 0xff000000u | q(bl) << 16 | q(g) << 8 | q(r);  // bytes R, G, B, X
+     }
++    if (rep) mend_rows(k, hit);
++  }
++
++  // AnalogRX sparkle repair: up to 3 badly hit rows in a row are redrawn from the good rows above and below
++  // them in the same field (blended by distance), once the row below has come in. Nothing older is used, so
++  // there is no tearing in motion; a longer run is left as it is.
++  void mend_rows(int64_t k, bool hit) {
++    if (mend_field != fields_seen || mend_cur != cur_field) {
++      mend_field = fields_seen;
++      mend_cur = cur_field;
++      bad_from = -1;
++    }
++    if (hit) {
++      if (bad_from < 0) bad_from = k;
++      return;
++    }
++    if (bad_from >= 1 && k - bad_from <= 3) {
++      uint8_t *buf = (cur_field == 0 ? fieldA : fieldB).data();
++      const size_t rowb = static_cast<size_t>(o.width) * 4;
++      const uint8_t *top = buf + static_cast<size_t>(bad_from - 1) * rowb, *bot = buf + static_cast<size_t>(k) * rowb;
++      const int span = static_cast<int>(k - (bad_from - 1));
++      for (int64_t r = bad_from; r < k; r++) {
++        const int wb = static_cast<int>(r - (bad_from - 1)), wt = span - wb;
++        uint8_t *dst = buf + static_cast<size_t>(r) * rowb;
++        for (size_t x = 0; x < rowb; x++) dst[x] = static_cast<uint8_t>((top[x] * wt + bot[x] * wb + span / 2) / span);
++        lines_kept++;
++      }
++    }
++    bad_from = -1;
++  }
++
++  // AnalogRX sparkle repair. Patches the picture of the line starting at ls: each run of marked samples
++  // (widened by the luma / chroma filters' spread) becomes a straight line between the points either side, in
++  // the filtered luma and chroma. Returns true when the line is still badly hit (over 8 % of it lost, or a run
++  // too long to patch): mend_rows() then redraws it from its neighbours.
++  bool patch_line(double ls) {
++    const double a0 = std_->a0_us * 1e-6 * fs, aw = std_->aw_us * 1e-6 * fs;
++    const int64_t s0 = static_cast<int64_t>(ls + a0) - 4, s1 = static_cast<int64_t>(ls + a0 + aw) + 4;
++    if (s1 + 16 >= static_cast<int64_t>(n) || static_cast<int64_t>(n) - s0 > static_cast<int64_t>(ring_mask) - 32) return false;
++    constexpr int kBack = 3, kFwd = 8, kMaxRun = 64;  // filter spread (samples) either side; longest patch
++    int64_t lost = 0;
++    bool too_long = false;
++    for (int64_t i = s0; i < s1;) {
++      if (!bad_ring[i & ring_mask]) {
++        i++;
++        continue;
++      }
++      int64_t j = i;
++      while (j < s1 + kFwd && bad_ring[j & ring_mask]) j++;
++      lost += j - i;
++      const int64_t a = i - kBack, b = j + kFwd;  // patch [a, b): anchors a - 1 and b
++      if (b - a <= kMaxRun) {
++        const float la = luma_ring[(a - 1) & ring_mask], lb = luma_ring[b & ring_mask];
++        const cf ca = chroma_ring[(a - 1) & ring_mask], cb = chroma_ring[b & ring_mask];
++        const float inv = 1.f / static_cast<float>(b - a + 1);
++        for (int64_t q = a; q < b; q++) {
++          const float t = static_cast<float>(q - a + 1) * inv;
++          luma_ring[q & ring_mask] = la + (lb - la) * t;
++          chroma_ring[q & ring_mask] = ca + (cb - ca) * t;
++        }
++        clicks_repaired++;
++      } else {
++        too_long = true;
++      }
++      i = j;
++    }
++    return too_long || lost > 0.08 * aw;
+   }
+ 
+   float ring_mean(double from, double to) {
+@@ -704,8 +784,11 @@
+ }
+ }  // namespace
+ 
+-void FrontEnd::demod(const cf *xs, size_t n, std::vector<float> &out) {
++void FrontEnd::demod(const cf *xs, size_t n, std::vector<float> &out, std::vector<uint8_t> *bad) {
+   out.clear();
++  const bool rep = repair_on() && bad;
++  _env.clear();
++  if (bad) bad->clear();
+   const float k = static_cast<float>(_fs_out / (2 * M_PI) / 1e6);  // rad/sample -> MHz
+   constexpr int H = kHb - 1;
+   while (n > 0) {
+@@ -770,18 +853,67 @@
+       }
+       _prev = cf(_yr[ny - 1], _yi[ny - 1]);
+     }
++    if (rep)
++      for (int j = 0; j < ny; j++) _env.push_back(_yr[j] * _yr[j] + _yi[j] * _yi[j]);
+     xs += m;
+     n -= m;
+   }
++  // AnalogRX sparkle repair: a click is where the envelope drops under kDip of its recent level (~2 ms) AND
++  // the phase slips about a whole turn across that dip (the discriminator's area over it, against the level
++  // either side). Indoors, wall echoes put dips in the envelope at certain brightness levels with no slip: those
++  // are picture, not clicks, and are left alone.
++  if (rep && !_env.empty()) {
++    constexpr float kDip = 0.12f;  // -9 dB
++    constexpr int kWiden = 2;
++    constexpr double kSlip = 0.7;  // turns
++    double m = 0;
++    for (float e : _env) m += e;
++    m /= _env.size();
++    _pref = _pref <= 0 ? static_cast<float>(m) : _pref + 0.1f * (static_cast<float>(m) - _pref);
++    const float thr = kDip * _pref;
++    const size_t N = std::min(_env.size(), out.size());
++    const double turns = 1e6 / _fs_out;  // MHz x one sample -> turns
++    bad->assign(out.size(), 0);
++    for (size_t i = 0; i < N;) {
++      if (_env[i] >= thr) {
++        i++;
++        continue;
++      }
++      size_t j = i;
++      while (j < N && _env[j] < thr) j++;
++      const size_t a = i >= kWiden ? i - kWiden : 0, b = std::min(N, j + kWiden);
++      bool click = true;  // at the very edge of this call it can't be told: treat it as one
++      if (a >= 3 && b + 3 <= N) {
++        const float base = (out[a - 1] + out[a - 2] + out[a - 3] + out[b] + out[b + 1] + out[b + 2]) / 6.f;
++        double area = 0;
++        for (size_t q = a; q < b; q++) area += out[q] - base;
++        click = std::fabs(area * turns) > kSlip;
++      }
++      if (click)
++        for (size_t q = a; q < b; q++) (*bad)[q] = 1;
++      i = j;
++    }
++  }
+ }
+ 
+-void FrontEnd::decode(const float *d, size_t n) {
+-  for (size_t i = 0; i < n; i++) _dec->push(d[i]);
++void FrontEnd::decode(const float *d, size_t n, const uint8_t *bad) {
++  if (bad)
++    for (size_t i = 0; i < n; i++) _dec->push(d[i], bad[i]);
++  else
++    for (size_t i = 0; i < n; i++) _dec->push(d[i]);
+ }
+ 
+ void FrontEnd::feed(const cf *xs, size_t n) {
+-  demod(xs, n, _dbuf);
+-  decode(_dbuf.data(), _dbuf.size());
++  std::vector<uint8_t> bad;
++  demod(xs, n, _dbuf, &bad);
++  decode(_dbuf.data(), _dbuf.size(), bad.empty() ? nullptr : bad.data());
++}
++
++// ---- AnalogRX: sparkle repair switch (every decoder in the process)
++namespace {
++std::atomic<bool> g_repair{false};
+ }
++void set_repair(bool on) { g_repair = on; }
++bool repair_on() { return g_repair.load(std::memory_order_relaxed); }
+ 
+ }  // namespace kp
+--- a/native/dsp/video.h
++++ b/native/dsp/video.h
+@@ -40,6 +40,8 @@
+   uint64_t fields = 0, frames = 0;        // since construction
+   uint64_t acquisitions = 0, losses = 0;  // successful acquisitions, lock losses
+   uint64_t rephases = 0;                  // line grid moved onto a jumped signal without re-acquiring
++  // AnalogRX sparkle repair (set_repair): FM clicks patched over, and badly hit lines kept from the last field
++  uint64_t clicks_repaired = 0, lines_kept = 0;
+   double line_us = 0;                     // tracked line period
+   float lock_recent = 0;                  // locked fraction over the last ~2 fields
+   bool colour = false;                    // colour is being decoded (burst present and steady)
+@@ -62,6 +64,14 @@
+ 
+ class Decoder;
+ 
++// AnalogRX: sparkle repair, for every decoder in the process (takes effect at once). The white / black
++// sparkles of a weak signal are FM "clicks": they happen where the carrier's envelope collapses. The front end
++// marks those instants; the decoder, which draws each line about a line after it arrives, patches the picture
++// over each mark (a straight line between the good points either side; sync is left alone) and keeps a badly
++// hit line from the last field instead of drawing it. Nothing is held back: no delay is added.
++void set_repair(bool on);
++bool repair_on();
++
+ // IQ (at fs_in) -> DC removal -> NCO -> [halfband /2 when fs_in >= 40e6] -> FM discriminator -> Decoder.
+ class FrontEnd {
+ public:
+@@ -72,8 +82,9 @@
+   void feed(const cf *x, size_t n);  // demod + decode
+   // The two halves, for running them on two threads: demod() -> discriminator output (MHz at fs_demod),
+   // decode() -> frames. Each half is single-threaded.
+-  void demod(const cf *x, size_t n, std::vector<float> &out);
+-  void decode(const float *d, size_t n);
++  // bad (optional, sparkle repair): per output sample, 1 = the carrier's envelope collapsed there (a click)
++  void demod(const cf *x, size_t n, std::vector<float> &out, std::vector<uint8_t> *bad = nullptr);
++  void decode(const float *d, size_t n, const uint8_t *bad = nullptr);
+   DecoderStats stats() const;
+   double fs_demod() const { return _fs_out; }
+ 
+@@ -90,6 +101,8 @@
+   int _phase = 0;                  // start of the next halfband window in the next chunk (0 or 1)
+   std::vector<float> _dbuf;
+   Decoder *_dec;
++  std::vector<float> _env;  // sparkle repair: each output sample's envelope (power)
++  float _pref = 0;          // ... and its recent level
+ };
+ 
+ }  // namespace kp

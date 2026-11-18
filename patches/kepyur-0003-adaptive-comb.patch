@@ -1,0 +1,110 @@
+--- a/native/dsp/video.cpp
++++ b/native/dsp/video.cpp
+@@ -88,6 +88,9 @@
+     // AnalogRX comb luma: one gentle section (Q 0.6: no peaking, ~1 % overshoot), -3 dB near 4 MHz
+     lp_wide.design(4.8e6, fs, 0.6);
+     wide_ring.assign(8192, 0);
++    lp_vert.design(1.0e6, fs);  // adaptive comb: brightness below the colour band, line against line
++    lf_ring.assign(8192, 0);
++    d_ring.assign(8192, 0);
+     comb_mode = o.luma_filter >= 0 ? o.luma_filter == 1 : [] {
+       const char *e = std::getenv("ARX_LUMA");
+       return !(e && std::string(e) == "classic");
+@@ -160,13 +163,36 @@
+         const float a = wide_ring[q0 & ring_mask], b = wide_ring[(q0 + 1) & ring_mask];
+         wp = a + (b - a) * fr;
+       }
+-      luma_ring[n & ring_mask] = w - bp_chroma.run(0.5f * (w - wp));
++      float luma = w - bp_chroma.run(0.5f * (w - wp));
++      // AnalogRX adaptive comb: how different the line before is, below the colour band (so colour itself,
++      // which flips from line to line, doesn't count), in sync depths; past ~0.25 fall back, fully by ~0.6
++      const float lf = lp_vert.run(w);
++      lf_ring[n & ring_mask] = lf;
++      const float ln = luma_notch_w.run(w);
++      cfade = 0;
++      d_ring[n & ring_mask] = d;
++      csrc = d;
++      if (adaptive_comb_on() && qpos > 1) {
++        const int64_t q0 = static_cast<int64_t>(qpos);
++        const float fr = static_cast<float>(qpos - q0);
++        const float pa = lf_ring[q0 & ring_mask], pb = lf_ring[(q0 + 1) & ring_mask];
++        const float dv = std::fabs(lf - (pa + (pb - pa) * fr));
++        vdiff += (dv - vdiff) * 0.35f;  // ~3 samples: a whole edge, not one noisy sample
++        const float depth = std::max(blank - tip, 0.2f);
++        cfade = std::clamp((vdiff / depth - 0.25f) / 0.35f, 0.f, 1.f);
++        luma += (ln - luma) * cfade;
++        // and the colour combed too: half the difference with the line before keeps the colour (it flips from line
++        // to line) and cancels brightness detail that continues down the picture (the strokes of OSD characters)
++        const float da = d_ring[q0 & ring_mask], db = d_ring[(q0 + 1) & ring_mask];
++        csrc = 0.5f * (d - (da + (db - da) * fr));
++      }
++      luma_ring[n & ring_mask] = luma;
+     } else {
+       luma_ring[n & ring_mask] = luma_notch.run(lp_luma2.run(lp_luma.run(d)));
+     }
+     if (o.colour) {
+       // the oscillator's phase belongs to the absolute sample index: burst and picture share it
+-      const cf c = d * std::conj(lo);
++      const cf c = (comb_on ? csrc : d) * (1.f - cfade) * std::conj(lo);  // AnalogRX adaptive comb: combed colour, faded at OSD edges
+       lo *= lo_step;
+       if ((n & 4095) == 0) lo /= std::abs(lo);
+       chroma_ring[n & ring_mask] = cf(cl_r2.run(cl_r1.run(c.real())), cl_i2.run(cl_i1.run(c.imag())));
+@@ -238,6 +264,11 @@
+   // AnalogRX comb luma (DecoderOpts::luma_filter)
+   Biquad lp_wide, bp_chroma;
+   std::vector<float> wide_ring;
++  // AnalogRX adaptive comb (set_adaptive_comb)
++  Biquad lp_vert, luma_notch_w;
++  std::vector<float> lf_ring;
++  std::vector<float> d_ring;  // the discriminator output (colour comb)
++  float vdiff = 0, cfade = 0, csrc = 0;
+   bool comb_mode = true, comb_on = false;
+   double cdel_comb = 0;
+   bool low = false, longrun = false;
+@@ -290,6 +321,7 @@
+     const double a = 2 * M_PI * fsc / fs;
+     lo_step = cf(static_cast<float>(std::cos(a)), static_cast<float>(std::sin(a)));
+     luma_notch.notch(fsc, fs, 1.5);  // the subcarrier out of the picture (also the B/W herringbone)
++    luma_notch_w.notch(fsc, fs, 1.5);  // AnalogRX adaptive comb: the same, on the comb's wide signal
+     bp_chroma.bandpass(fsc, fs, 1.0);  // comb: the colour band of the line difference
+     comb_on = comb_mode && &s == &kNtsc;  // PAL's colour needs a two-line comb: notch for now
+     prev_uv.assign(o.width, cf{});
+@@ -916,4 +948,11 @@
+ void set_repair(bool on) { g_repair = on; }
+ bool repair_on() { return g_repair.load(std::memory_order_relaxed); }
+ 
++// ---- AnalogRX: adaptive comb switch (every decoder in the process)
++namespace {
++std::atomic<bool> g_acomb{false};
++}
++void set_adaptive_comb(bool on) { g_acomb = on; }
++bool adaptive_comb_on() { return g_acomb.load(std::memory_order_relaxed); }
++
+ }  // namespace kp
+--- a/native/dsp/video.h
++++ b/native/dsp/video.h
+@@ -65,13 +65,20 @@
+ class Decoder;
+ 
+ // AnalogRX: sparkle repair, for every decoder in the process (takes effect at once). The white / black
+-// sparkles of a weak signal are FM "clicks": they happen where the carrier's envelope collapses. The front end
+-// marks those instants; the decoder, which draws each line about a line after it arrives, patches the picture
+-// over each mark (a straight line between the good points either side; sync is left alone) and keeps a badly
+-// hit line from the last field instead of drawing it. Nothing is held back: no delay is added.
++// sparkles of a weak signal are FM "clicks": the carrier's envelope collapses and its phase slips a turn. The
++// front end marks those instants; the decoder, which draws each line about a line after it arrives, patches the
++// picture over each mark (a straight line between the good points either side; sync is left alone) and redraws
++// a badly hit line from the lines above and below it. Nothing is held back: no delay is added.
+ void set_repair(bool on);
+ bool repair_on();
+ 
++// AnalogRX: adaptive comb (NTSC comb mode), for every decoder in the process. The comb separates colour from
++// brightness by comparing each line with the one before; where that line is clearly different (OSD text,
++// horizons) it leaves a halo and false colour. There the brightness falls back to the notch filter and the
++// colour is faded out. Uses only the line before: no delay is added.
++void set_adaptive_comb(bool on);
++bool adaptive_comb_on();
++
+ // IQ (at fs_in) -> DC removal -> NCO -> [halfband /2 when fs_in >= 40e6] -> FM discriminator -> Decoder.
+ class FrontEnd {
+ public:

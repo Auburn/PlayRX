@@ -1,0 +1,33 @@
+diff --git a/libusb/os/windows_winusb.c b/libusb/os/windows_winusb.c
+index c77bd209..6ef275b0 100644
+--- a/libusb/os/windows_winusb.c
++++ b/libusb/os/windows_winusb.c
+@@ -2745,6 +2745,28 @@ static int winusbx_configure_endpoints(int sub_api, struct libusb_device_handle
+ 				ISO_ALWAYS_START_ASAP, sizeof(UCHAR), &policy))
+ 				usbi_dbg(HANDLE_CTX(dev_handle), "failed to enable ISO_ALWAYS_START_ASAP for endpoint %02X", endpoint_address);
+ 		}
++
++		/* AnalogRX: RAW_IO on the endpoints listed in LIBUSB_WINUSB_RAW_IO ("0x84" or "0x84,0x83").
++		 * Without it WinUSB hands queued reads to the host controller one at a time, which leaves gaps
++		 * a device streaming ~320 MB/s cannot tolerate. Every transfer on such a pipe must then be a
++		 * multiple of the endpoint's max packet size (the caller's responsibility). */
++		if ((endpoint_address & LIBUSB_ENDPOINT_IN) && sub_api == SUB_API_WINUSB) {
++			const char *list = getenv("LIBUSB_WINUSB_RAW_IO");
++			for (const char *p = list; p && *p;) {
++				char *end;
++				const unsigned long ep = strtoul(p, &end, 0);
++				if (end == p)
++					break;
++				if (ep == endpoint_address) {
++					if (WinUSBX[sub_api].SetPipePolicy(winusb_handle, endpoint_address, RAW_IO, sizeof(UCHAR), &policy))
++						usbi_info(HANDLE_CTX(dev_handle), "RAW_IO enabled on endpoint %02X", endpoint_address);
++					else
++						usbi_warn(HANDLE_CTX(dev_handle), "failed to enable RAW_IO on endpoint %02X (error %lu)",
++							endpoint_address, (unsigned long)GetLastError());
++				}
++				p = (*end == ',') ? end + 1 : end;
++			}
++		}
+ 	}
+ 
+ 	return LIBUSB_SUCCESS;

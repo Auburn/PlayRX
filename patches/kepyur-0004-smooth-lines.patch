@@ -1,0 +1,81 @@
+--- a/native/dsp/video.cpp
++++ b/native/dsp/video.cpp
+@@ -693,6 +693,36 @@
+     gated_lines++;
+   }
+ 
++  // AnalogRX smooth lines: field f (the upper field when upper) into the frame at its own lines, the lines
++  // between from the field lines above (p) and below (q), averaged along whichever of 5 directions matches best
++  // (so a diagonal edge stays a clean diagonal instead of a staircase)
++  void emit_field(const std::vector<uint8_t> &f, bool upper) {
++    const int W = o.width, A = std_->active;
++    const size_t rowb = static_cast<size_t>(W) * 4;
++    uint8_t *out = frame.data();
++    for (int r = 0; r < A; r++) std::memcpy(out + (2 * r + (upper ? 0 : 1)) * rowb, f.data() + r * rowb, rowb);
++    auto lum = [](const uint8_t *px) { return px[0] + 2 * px[1] + px[2]; };
++    for (int r = 0; r < A; r++) {
++      const int line = upper ? 2 * r + 1 : 2 * r;
++      const int rp = upper ? r : std::max(r - 1, 0), rq = upper ? std::min(r + 1, A - 1) : r;
++      const uint8_t *p = f.data() + rp * rowb, *q = f.data() + rq * rowb;
++      uint8_t *dst = out + line * rowb;
++      for (int x = 0; x < W; x++) {
++        int best = 0, bc = 1 << 30;
++        for (int d = -2; d <= 2; d++) {
++          const int xp = x + d, xq = x - d;
++          if (xp < 0 || xp >= W || xq < 0 || xq >= W) continue;
++          const int c = std::abs(lum(p + xp * 4) - lum(q + xq * 4)) + (d ? 24 + 8 * std::abs(d) : 0);  // prefer straight down
++          if (c < bc) bc = c, best = d;
++        }
++        const uint8_t *a = p + (x + best) * 4, *b = q + (x - best) * 4;
++        for (int k = 0; k < 4; k++) dst[x * 4 + k] = static_cast<uint8_t>((a[k] + b[k] + 1) >> 1);
++      }
++    }
++    frames_out++;
++    if (sink) sink(Frame{frame.data(), o.width, 2 * std_->active, std_});
++  }
++
+   void emit(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+     const size_t rowb = static_cast<size_t>(o.width) * 4;
+     for (int r = 0; r < std_->active; r++) {
+@@ -712,11 +742,11 @@
+       const bool odd = std::fabs(ph) < 0.25;
+       if (cur_field == 0) {
+         haveA = true;
+-        if (o.fields) emit(fieldA, fieldA);
++        if (o.fields) smooth_lines_on() ? emit_field(fieldA, false) : emit(fieldA, fieldA);  // A is the lower field (measured)
+       }
+       if (cur_field == 1) {
+         haveB = true;
+-        if (o.fields) emit(fieldB, fieldB);
++        if (o.fields) smooth_lines_on() ? emit_field(fieldB, true) : emit(fieldB, fieldB);
+       }
+       if (!o.fields && haveA && haveB) {
+         emit(fieldA, fieldB);
+@@ -955,4 +985,11 @@
+ void set_adaptive_comb(bool on) { g_acomb = on; }
+ bool adaptive_comb_on() { return g_acomb.load(std::memory_order_relaxed); }
+ 
++// ---- AnalogRX: smooth lines switch (every decoder in the process)
++namespace {
++std::atomic<bool> g_smooth{false};
++}
++void set_smooth_lines(bool on) { g_smooth = on; }
++bool smooth_lines_on() { return g_smooth.load(std::memory_order_relaxed); }
++
+ }  // namespace kp
+--- a/native/dsp/video.h
++++ b/native/dsp/video.h
+@@ -79,6 +79,13 @@
+ void set_adaptive_comb(bool on);
+ bool adaptive_comb_on();
+ 
++// AnalogRX: smooth lines (DecoderOpts::fields), for every decoder in the process. A field is every other line of
++// the picture; it used to be shown with each line twice (stair-stepped edges, and the two fields half a line
++// apart, so the picture shimmered up and down). On: each field's lines go in their own place and the lines
++// between are interpolated along edges (edge-based line averaging). Done as each field ends: no delay.
++void set_smooth_lines(bool on);
++bool smooth_lines_on();
++
+ // IQ (at fs_in) -> DC removal -> NCO -> [halfband /2 when fs_in >= 40e6] -> FM discriminator -> Decoder.
+ class FrontEnd {
+ public:

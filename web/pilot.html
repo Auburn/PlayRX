@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pilot feed</title>
+<link rel="stylesheet" href="/ui/arx.css">
+</head>
+<!-- OBS Browser Source: one pilot slot's video with a name tag and lap counter.
+     /pilot/N            video + name + laps
+     /pilot/N?name=0     no name tag      ?laps=0  no lap counter
+     ?slot=1             also the slot number in the name tag (off by default: in a race it reads like a position) -->
+<body class="broadcast">
+<div class="bc-pilot">
+  <canvas id="v"></canvas>
+  <div class="bc-nosig hidden" id="ns">NO SIGNAL</div>
+  <div class="bc-laps hidden" id="laps"></div>
+  <div class="bc-tag hidden" id="tag"><span class="n hidden" id="n"></span><span class="nm" id="nm"></span><span class="ch" id="ch"></span></div>
+</div>
+<script type="module">
+import {$, get, secs, every, video} from '/ui/arx.js';
+const slot = Number(location.pathname.split('/').filter(Boolean).pop()) || 1;
+const opt = new URLSearchParams(location.search);
+// the video over a WebSocket (reconnects by itself; any number of OBS sources can run side by side)
+video([slot], () => $('#v'));
+$('#n').textContent = slot;
+$('#n').classList.toggle('hidden', opt.get('slot') !== '1');
+every(500, async () => {
+  const [slots, race] = await Promise.all([get('/api/slots'), get('/api/race')]);
+  const s = slots[slot - 1], r = race.pilots[slot - 1];
+  $('#tag').classList.toggle('hidden', !s.used || opt.get('name') === '0');
+  $('#nm').textContent = s.name;
+  $('#ch').textContent = s.channel;
+  $('#ns').classList.toggle('hidden', !s.used || s.live);
+  const showLaps = s.used && opt.get('laps') !== '0' && (r.laps > 0 || race.running);
+  $('#laps').classList.toggle('hidden', !showLaps);
+  if (showLaps) $('#laps').innerHTML = r.laps ? `LAP ${r.laps}<small>${secs(r.last_s)}</small>` : 'LAP 0';
+});
+</script>
+</body>
+</html>
