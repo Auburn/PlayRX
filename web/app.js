@@ -146,7 +146,7 @@ function route() {
   document.body.classList.toggle('node-mode', nodeMode);
   const name = name0 || (nodeMode ? 'node' : S.state?.edition === 'rx' ? 'live' : 'dash');  // Play League opens on the Dashboard; a feed node on its page
   const rxOff = S.state?.edition === 'rx' && ['dash', 'timing', 'start', 'race', 'events', 'roster', 'leagues', 'quick', 'replay'].includes(name);  // racing views: Play League only
-  const nodeOff = nodeMode && !['node', 'live', 'pilots', 'adapters', 'settings', 'log'].includes(name);  // a feed node: no racing pages
+  const nodeOff = nodeMode && !['node', 'live', 'pilots', 'adapters', 'settings', 'log', 'timing'].includes(name);  // a feed node: no racing pages (Timing: view only)
   const view = nodeOff ? 'node' : views[name] && !rxOff ? name : 'live';
   $$('#nav .nav-item').forEach(a => a.classList.toggle('active', a.dataset.view === view));
   if (current?.unmount) current.unmount();

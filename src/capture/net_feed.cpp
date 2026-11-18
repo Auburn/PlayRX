@@ -213,11 +213,11 @@ struct NetFeed::State {
   std::atomic<int> node_slot{0};
   mutable std::mutex m;  // the fields below
   std::string error, status, name, channel;
-  double mhz = 0;
+  double mhz = 0, gain_db = 30;
   uint64_t pilot_gen = 0;
 };
 
-void NetFeed::start(const std::string &id, const std::string &key, const std::string &name, double mhz, const std::string &channel,
+void NetFeed::start(const std::string &id, const std::string &key, const std::string &name, double mhz, const std::string &channel, double gain_db,
                     FrameSink frames, LevelSink levels) {
   stop(false);
   _id = id;
@@ -228,7 +228,7 @@ void NetFeed::start(const std::string &id, const std::string &key, const std::st
     return;
   }
   st->key = key, st->frames = std::move(frames), st->levels = std::move(levels);
-  st->name = name, st->mhz = mhz, st->channel = channel;
+  st->name = name, st->mhz = mhz, st->channel = channel, st->gain_db = gain_db;
   _st = st;
   std::thread([st] {
 #ifdef _WIN32
@@ -243,14 +243,14 @@ void NetFeed::start(const std::string &id, const std::string &key, const std::st
       st->connected = false;
       // 1. ask the node for a slot for this pilot (the same one again after a reconnect)
       std::string name, channel, out;
-      double mhz;
+      double mhz, gain;
       uint64_t gen;
       {
         std::lock_guard<std::mutex> l(st->m);
-        name = st->name, channel = st->channel, mhz = st->mhz, gen = st->pilot_gen;
+        name = st->name, channel = st->channel, mhz = st->mhz, gain = st->gain_db, gen = st->pilot_gen;
       }
       std::ostringstream b;
-      b << "{\"key\":\"" << jesc(st->key) << "\",\"name\":\"" << jesc(name) << "\",\"mhz\":" << mhz << ",\"channel\":\"" << jesc(channel) << "\"}";
+      b << "{\"key\":\"" << jesc(st->key) << "\",\"name\":\"" << jesc(name) << "\",\"mhz\":" << mhz << ",\"channel\":\"" << jesc(channel) << "\",\"gain_db\":" << gain << "}";
       const int code = http_request(st->host, st->port, "POST", "/api/node/feed", b.str(), out);
       const int slot = static_cast<int>(jnum_(out, "slot"));
       if (code != 200 || slot < 1) {
@@ -282,9 +282,9 @@ void NetFeed::start(const std::string &id, const std::string &key, const std::st
           std::lock_guard<std::mutex> l(st->m);
           if (st->pilot_gen != gen) {
             gen = st->pilot_gen;
-            name = st->name, channel = st->channel, mhz = st->mhz;
+            name = st->name, channel = st->channel, mhz = st->mhz, gain = st->gain_db;
             std::ostringstream u;
-            u << "{\"key\":\"" << jesc(st->key) << "\",\"name\":\"" << jesc(name) << "\",\"mhz\":" << mhz << ",\"channel\":\"" << jesc(channel) << "\"}";
+            u << "{\"key\":\"" << jesc(st->key) << "\",\"name\":\"" << jesc(name) << "\",\"mhz\":" << mhz << ",\"channel\":\"" << jesc(channel) << "\",\"gain_db\":" << gain << "}";
             std::thread([h = st->host, p = st->port, body = u.str()] { std::string o; http_request(h, p, "POST", "/api/node/feed", body, o); }).detach();
           }
         }
@@ -374,11 +374,11 @@ void NetFeed::stop(bool release) {
   _id.clear();
 }
 
-void NetFeed::set_pilot(const std::string &name, double mhz, const std::string &channel) {
+void NetFeed::set_pilot(const std::string &name, double mhz, const std::string &channel, double gain_db) {
   if (!_st) return;
   std::lock_guard<std::mutex> l(_st->m);
-  if (_st->name == name && _st->mhz == mhz && _st->channel == channel) return;
-  _st->name = name, _st->mhz = mhz, _st->channel = channel;
+  if (_st->name == name && _st->mhz == mhz && _st->channel == channel && _st->gain_db == gain_db) return;
+  _st->name = name, _st->mhz = mhz, _st->channel = channel, _st->gain_db = gain_db;
   _st->pilot_gen++;
 }
 bool NetFeed::connected() const { return _st && _st->connected; }

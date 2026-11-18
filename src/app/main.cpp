@@ -689,7 +689,8 @@ std::string settings_json() {
   o << "{\"bands\":[";
   for (size_t i = 0; i < s.bands.size(); i++) o << (i ? "," : "") << "\"" << s.bands[i] << "\"";
   o << "],\"lan\":" << b(s.lan) << ",\"lan_active\":" << b(g_app.lan) << ",\"port\":" << g_feeds.port()
-    << ",\"guided\":" << b(s.guided) << ",\"auto_gate\":" << b(s.auto_gate) << ",\"passes\":" << s.passes << ",\"voice\":" << b(s.voice)
+    << ",\"guided\":" << b(s.guided) << ",\"auto_gate\":" << b(s.auto_gate)
+    << ",\"passes\":" << s.passes << ",\"voice\":" << b(s.voice)
     << ",\"volume\":" << s.volume << ",\"rate\":" << s.rate << ",\"pitch\":" << s.pitch << ",\"voice_id\":" << q(s.voice_id) << ",\"precheck\":" << q(s.precheck) << ",\"timing_only\":" << b(s.timing_only) << ",\"timing_wide\":" << b(s.timing_wide) << ",\"portable\":" << b(s.portable) << ",\"call_laps\":" << b(s.call_laps) << ",\"msps\":" << s.msps << ",\"diversity\":" << b(s.diversity) << ",\"repair\":" << b(s.repair) << ",\"offset_tune\":" << b(s.offset_tune) << ",\"acomb\":" << b(s.acomb) << ",\"smooth_lines\":" << b(s.smooth_lines) << ",\"comb\":" << b(s.comb) << ",\"quick_mode\":" << q(s.quick_mode)
     << ",\"quick_laps\":" << s.quick_laps << ",\"quick_time\":" << s.quick_time << ",\"pin_league\":" << s.pin_league << ",\"obs_on\":" << b(s.obs_on)
     << ",\"ts_on\":" << b(s.ts_on) << ",\"ts_host\":" << q(s.ts_host) << ",\"ts_port\":" << s.ts_port << ",\"ts_fps\":" << s.ts_fps << ",\"ts_kbps\":" << s.ts_kbps << ",\"ts_bars\":" << b(s.ts_bars) << ",\"vcam_mask\":" << s.vcam_mask
@@ -1039,11 +1040,11 @@ void net_tick() {
       }
       if (!want.empty() && s) {
         KP_LOGI("pilot %d: video and timing from feed node %s", i, capture_name(want).c_str());
-        f.start(want, net_key(i), s->name, s->mhz, s->ch(), [i](const uint8_t *p, int w, int h) { if (!parked(i)) slot_frame(i, p, w, h); },
+        f.start(want, net_key(i), s->name, s->mhz, s->ch(), g_timing.config(i).gain_db, [i](const uint8_t *p, int w, int h) { if (!parked(i)) slot_frame(i, p, w, h); },
                 [i](const std::vector<arx::LevelPoint> &pts) { if (!parked(i)) g_timing.add_levels(i, pts); });
       }
     } else if (!want.empty() && s) {
-      f.set_pilot(s->name, s->mhz, s->ch());  // the node retunes when the pilot or channel changes
+      f.set_pilot(s->name, s->mhz, s->ch(), g_timing.config(i).gain_db);  // the node retunes when the pilot, channel or gain changes
     }
   }
 }
@@ -1057,11 +1058,21 @@ std::string net_format(int n) {
   return o;
 }
 
+// Feed node: the race PC tunes the gate (it has the Timing page; a node has none), so its gain drives this adapter
+void node_gain(int n, const std::string &body) {
+  if (!jhas(body, "gain_db")) return;  // a race PC from before 0.9.2.51: the gain stays as it is
+  arx::GateConfig c = g_timing.config(n);
+  const double g = jnum(body, "gain_db");
+  if (c.gain_db == g) return;
+  c.gain_db = g;
+  g_timing.set_config(n, c);  // the engine applies it (and retunes) on its next pass
+}
 // Feed node: hand a slot (and so an adapter) to a race PC's pilot, or the same one again for the same key
 int node_feed(const std::string &key, const std::string &body) {
   for (int i = 1; i <= kMaxSlots; i++)
     if (active(i) && g_node_key[i] == key) {
       update_pilot(i, body);
+      node_gain(i, body);
       g_node_idle[i] = 0;
       return i;
     }
@@ -1071,11 +1082,13 @@ int node_feed(const std::string &key, const std::string &body) {
     if (active(i) && g_node_key[i].empty() && g_app.slots[i]->name == nm && g_feeds.node_clients(i) == 0) {
       g_node_key[i] = key;
       update_pilot(i, body);
+      node_gain(i, body);
       return i;
     }
   const int n = add_pilot(nm, jnum(body, "mhz"), jstr(body, "channel"), 0);
   if (n) {
     g_node_key[n] = key, g_node_idle[n] = 0;
+    node_gain(n, body);
     KP_LOGI("feed node: slot %d to %s (%s)", n, key.c_str(), nm.c_str());
   }
   return n;
@@ -2095,11 +2108,9 @@ bool api(const std::string &method, const std::string &full, const std::string &
         if (std::none_of(nodes.begin(), nodes.end(), [&](const arx::CaptureDevice &x) { return x.id == id; })) nodes.push_back({id, h});
       }
     }
-    std::string js = o.str();
-    js.pop_back();  // reopen the list: the feed nodes after the USB devices
+    std::string js = o.str();  // "[" and the USB devices, still open: the feed nodes follow them
     for (const auto &n : nodes) js += std::string(js.size() > 1 ? "," : "") + "{\"id\":" + q(n.id) + ",\"name\":" + q(n.name) + ",\"net\":true}";
     js += "]";
-    o.str(js);
     list.insert(list.end(), nodes.begin(), nodes.end());
     {
       std::lock_guard<std::mutex> l(g_capdevs_m);
@@ -2107,7 +2118,7 @@ bool api(const std::string &method, const std::string &full, const std::string &
         if (std::none_of(list.begin(), list.end(), [&](const arx::CaptureDevice &x) { return x.id == d.id; })) list.push_back(d);
       g_capdevs = list;
     }
-    out = o.str();
+    out = js;
     return true;
   }
 

@@ -20,7 +20,7 @@ void Timing::add_levels(int slot, const std::vector<LevelPoint> &pts) {
   std::lock_guard<std::mutex> l(s.m);
   for (const auto &p : pts)
     if (s.hist.empty() || p.t > s.hist.back().t) s.hist.push_back(p);
-  const double keep = s.hist.back().t - 20;
+  const double keep = s.hist.back().t - 40;
   while (!s.hist.empty() && s.hist.front().t < keep) s.hist.pop_front();
 }
 
@@ -32,7 +32,10 @@ double Timing::suggest_gain(int slot) {
   // strongest of both inputs over the last ~20 s (99th percentile: one spike should not decide it)
   std::vector<float> v;
   v.reserve(s.hist.size() * 2);
-  for (const auto &p : s.hist) v.push_back(std::max(p.a, p.b));
+  const double from = s.hist.back().t - 20;
+  for (const auto &p : s.hist)
+    if (p.t >= from) v.push_back(std::max(p.a, p.b));
+  if (v.empty()) return s.cfg.gain_db;
   const size_t k = v.size() * 99 / 100;
   std::nth_element(v.begin(), v.begin() + k, v.end());
   // nothing much there (quad off or far away): its "strongest" is the noise floor, don't chase that

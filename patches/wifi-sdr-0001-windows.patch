@@ -61,8 +61,38 @@ index 740bd8f..79a8132 100644
    int rate_sel = 5;     // fs = 80 MHz >> rate_sel: 5 = 2.5, 4 = 5, 3 = 10, 2 = 20, 1 = 40 MS/s; 0 = 80 MS/s
                          // (8812BU, gapped only: 80 MHz width + vendor BW80 RX DFIR, ~77 MHz at -6 dB)
    bool wide = true;     // at 40 MS/s: 40 MHz channel width (8812BU: + vendor BW40 RX DFIR; 8822C: devourer's
+diff --git a/src/session.cpp b/src/session.cpp
+index d66ab4e..11c4b0e 100644
+--- a/src/session.cpp
++++ b/src/session.cpp
+@@ -2,6 +2,7 @@
+ #include "session.h"
+ #include "receiver.h" // model_pid
+ 
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ #include "UsbOpen.h"
+@@ -94,6 +95,17 @@ void Session::open(const OpenOpts &o) {
+   // users own bulk-IN and want fixed gain. The switch (tuning.j3_runtime_thread, OpenIPC/devourer#498)
+   // is required: the pinned devourer (external/devourer) has it, and a build without it must fail.
+   cfg.tuning.j3_runtime_thread = false;
++  // Play League: Jaguar2 (8812BU/8822BU) init-time firmware register offload. The PHY tables (~44k table
++  // words) go to the chip as ~2800 batched commands the firmware replays, instead of one USB control transfer
++  // per write, which costs ~1-2 ms apiece under WinUSB. Measured on an 8812BU (Windows 11, USB 3): bring-up
++  // 47 s -> 11 s, same IQK result, same noise floor, same video lock (60 fps, 0.96). 1 = BB + AGC tables,
++  // 3 = also the RF tables; devourer re-applies the tables directly if the offload fails. On by default on
++  // Windows only (Linux / macOS bring up in ~3-5 s and are untested with it). WSDR_FW_TABLE_OFLD overrides
++  // (0 = off).
++#ifdef _WIN32
++  cfg.tuning.fw_table_offload = 3;
++#endif
++  if (const char *e = std::getenv("WSDR_FW_TABLE_OFLD")) cfg.tuning.fw_table_offload = std::atoi(e);
+   WiFiDriver driver(_log);
+   auto dev = driver.CreateRadio(h, ctx, lock, cfg);
+   if (!dev)
 diff --git a/src/stream88xx.cpp b/src/stream88xx.cpp
-index a663615..d243daf 100644
+index a663615..df77beb 100644
 --- a/src/stream88xx.cpp
 +++ b/src/stream88xx.cpp
 @@ -27,6 +27,7 @@ constexpr uint32_t kBankC2h[2] = {0x16000u, 0x06000u}; // TXFF 0x20000 / 0x30000
@@ -73,7 +103,31 @@ index a663615..d243daf 100644
  
  size_t chunk_off(int k) { return Stream8822b::kPrefix + static_cast<size_t>(k) * Stream8822b::kChunk; }
  
-@@ -161,6 +162,7 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+@@ -156,11 +157,31 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+     start();
+ 
+     const double budget5 = static_cast<double>(period5) - guard5;
++    // Play League: a bank the host collected too late mid-run (Windows pauses a bulk-IN read for a few hundred
++    // us now and then: ~1-3 a minute per adapter) used to end the run, and the restart cost far more than the
++    // bank. The bank is overrun either way - its trailer ends late ("deadline"), or the ADC overwrote a part's
++    // CPU-written descriptor before it shipped ("framing", right length, wrong descriptor) - and the stream
++    // carries on in step (the trailer's seq still checks), so drop just that bank, as at the start of a run.
++    // Banks are timestamped on arrival, so a dropped one leaves no time shift. A burst (more than 4 drops within
++    // 64 banks) still ends the run: that is not an occasional pause.
++    uint32_t drop_burst = 0, last_drop = 0;
++    const auto mid_drop = [&](uint32_t s, const std::string &why) {
++      if (s - last_drop > 64)
++        drop_burst = 0;
++      last_drop = s;
++      if (++drop_burst > 4)
++        return false;
++      st.mid_drops++;
++      if (st.mid_drops <= 4 || st.mid_drops % 50 == 0)
++        std::fprintf(stderr, "stream: bank %u %s, dropped (%u this run)\n", s, why.c_str(), st.mid_drops);
++      return true;
++    };
+     for (uint32_t seq = 0;; seq++) {
+       if (stop && *stop)
          break;
        const int b = _c.gapped ? 0 : static_cast<int>(seq & 1);
        int part = 0;
@@ -81,15 +135,16 @@ index a663615..d243daf 100644
        BankInfo bi;
        bi.seq = seq;
        bi.bank = b;
-@@ -200,6 +202,16 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+@@ -200,12 +221,30 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
            rd.release();
            continue;
          }
 +        // AnalogRX: the late start (above) overruns the next bank too; the chip then sends that bank's trailer
 +        // early, one 16 KiB part short. Within the first banks of a run, drop the incomplete bank and go on.
-+        if (part < 4 && seq < kStartGraceBanks && static_cast<size_t>(d.len) == 24 + kTrailerPayload &&
-+            std::memcmp(d.data, trl_desc, 12) == 0) {
-+          if (st.start_late_skips++ < 4)
++        // Play League: mid-run the same overrun is dropped too (see mid_drop), once per bank.
++        if (part < 4 && static_cast<size_t>(d.len) == 24 + kTrailerPayload && std::memcmp(d.data, trl_desc, 12) == 0 &&
++            (seq < kStartGraceBanks || late_skip || mid_drop(seq, "short (" + std::to_string(part) + " of 4 parts)"))) {
++          if (seq < kStartGraceBanks && st.start_late_skips++ < 4)
 +            std::fprintf(stderr, "stream: bank %u short (%d of 4 parts) at the start of the run, dropped\n", seq, part);
 +          late_skip = true;
 +          rd.release();
@@ -98,7 +153,23 @@ index a663615..d243daf 100644
          const bool trailer = part == 4;
          const uint8_t *want = trailer ? trl_desc : data_desc;
          const size_t want_len = 24 + (trailer ? kTrailerPayload : kChunk);
-@@ -217,15 +229,31 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
+-        if (static_cast<size_t>(d.len) != want_len || std::memcmp(d.data, want, 12) != 0)
+-          throw std::runtime_error("framing: bank " + std::to_string(seq) + " part " + std::to_string(part) +
+-                                   " len " + std::to_string(d.len) + " desc " + hex12(d.data));
++        if (static_cast<size_t>(d.len) != want_len || std::memcmp(d.data, want, 12) != 0) {
++          // Play League: a data part of the right length whose descriptor the ADC overwrote (an overrun, see
++          // mid_drop): keep reading the bank's parts so the stream stays in step, then drop the bank.
++          const bool overrun = !trailer && static_cast<size_t>(d.len) == want_len && seq >= kStartGraceBanks &&
++                               (late_skip || mid_drop(seq, "part " + std::to_string(part) + " overwritten (" + hex12(d.data) + ")"));
++          if (!overrun)
++            throw std::runtime_error("framing: bank " + std::to_string(seq) + " part " + std::to_string(part) +
++                                     " len " + std::to_string(d.len) + " desc " + hex12(d.data));
++          late_skip = true;
++        }
+         if (!trailer) {
+           std::memcpy(bank.data() + chunk_off(part), d.data + 24, kChunk);
+         } else {
+@@ -217,15 +256,33 @@ StreamStats Stream8822b::run(const std::function<bool(const uint8_t *, const Ban
            bi.late_us = static_cast<int32_t>(stamp[2] - stamp[1]) / 5.0;
            bi.ship_us = static_cast<int32_t>(stamp[3] - stamp[2]) / 5.0;
            bi.end_us = static_cast<int32_t>(stamp[3] - stamp[1]) / 5.0;
@@ -115,6 +186,8 @@ index a663615..d243daf 100644
 +              if (st.start_late_skips++ < 4)
 +                std::fprintf(stderr, "stream: bank %u ended %.1f us after due at the start of the run, dropped\n",
 +                             seq, bi.end_us);
++            } else if (late_skip || mid_drop(seq, "ended " + std::to_string(static_cast<int>(bi.end_us)) + " us after due")) {
++              late_skip = true;  // Play League: dropped mid-run instead of ending it (see mid_drop)
 +            } else {
 +              throw std::runtime_error("deadline: bank " + std::to_string(seq) + " ended " +
 +                                       std::to_string(bi.end_us) + " us after due");
@@ -134,14 +207,15 @@ index a663615..d243daf 100644
        // sentinel in the last sample. In live data the ADC must have overwritten all of them.
        uint8_t *tail = bank.data() + kBankBytes - 8;
 diff --git a/src/stream88xx.h b/src/stream88xx.h
-index 69c6cb3..108f60d 100644
+index 69c6cb3..0b04054 100644
 --- a/src/stream88xx.h
 +++ b/src/stream88xx.h
-@@ -51,6 +51,7 @@ struct StreamStats {
+@@ -51,6 +51,8 @@ struct StreamStats {
    unsigned stale = 0;
    unsigned pattern_bad = 0;
    unsigned start_retries = 0; // starts repeated because the first packet never came (issue #2)
 +  unsigned start_late_skips = 0; // AnalogRX: late banks dropped at the start of a run (behind a USB hub)
++  unsigned mid_drops = 0;        // Play League: banks dropped mid-run (shipped late / overrun) instead of a restart
    double late_max_us = 0, ship_max_us = 0, end_max_us = 0;
    double wall_s = 0;
    std::string error;       // empty unless the stream stopped on a fault

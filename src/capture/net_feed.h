@@ -42,11 +42,11 @@ class NetFeed {
   ~NetFeed() { stop(false); }
   // Feed `key` (this PC + slot, so the node gives the same slot back after a reconnect) from the node at
   // host:port, for the pilot given. Runs on a thread of its own and reconnects by itself.
-  void start(const std::string &id, const std::string &key, const std::string &name, double mhz, const std::string &channel,
+  void start(const std::string &id, const std::string &key, const std::string &name, double mhz, const std::string &channel, double gain_db,
              FrameSink frames, LevelSink levels);
   // release: tell the node it may give the slot to someone else
   void stop(bool release);
-  void set_pilot(const std::string &name, double mhz, const std::string &channel);
+  void set_pilot(const std::string &name, double mhz, const std::string &channel, double gain_db);  // gain_db < 0: the chip's AGC
   const std::string &id() const { return _id; }
   bool connected() const;
   int64_t last_frame_ms() const;  // steady ms of the newest picture (0 none)

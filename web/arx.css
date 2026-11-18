@@ -401,7 +401,7 @@ body.broadcast { background: transparent; overflow: hidden; }
 /* ---------- editions: Play RX hides the racing parts of the shared UI ---------- */
 body.rx .league-only { display: none !important; }
 /* feed node mode: only the pages a node needs (its slots are run by the race PC) */
-body.node-mode .league-only, body.node-mode #nav .nav-item[data-view="obs"] { display: none !important; }
+body.node-mode .league-only:not([data-view="timing"]), body.node-mode #nav .nav-item[data-view="obs"] { display: none !important; }  /* Timing stays: view only on a node */
 .nd-addr { font: 600 var(--fs-xl) var(--mono); }
 .nd-slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--s3); }
 .nd-slot { border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; background: var(--surface); }
@@ -807,6 +807,20 @@ html.fd-light {
 .fd-gf { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--s2); font-size: var(--fs-sm); color: var(--text-2); }
 .fd-gf label { display: flex; flex-direction: column; gap: 4px; }
 .fd-gf .input { height: 44px; width: 100%; font-size: var(--fs-lg); }
+/* the rest of the gate settings (timing input, thresholds, smoothing, gain): one row each */
+.fd-gs { display: flex; flex-direction: column; gap: var(--s2); font-size: var(--fs-sm); color: var(--text-2); }
+.fd-gr { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); flex-wrap: wrap; min-height: 44px; }
+.fd-gr .seg button { height: 40px; padding: 0 10px; }
+.fd-gr .seg button:disabled { opacity: .45; cursor: default; }
+.fd-unit { display: inline-flex; align-items: center; gap: 6px; }
+.fd-unit .input { width: 88px; height: 44px; font-size: var(--fs-lg); }
+.fd-gr .btn-sm { height: 40px; }
+.fd-gnote:empty { display: none; }
+/* the Gate tab: announce passes (a switch above the cards) */
+.fd-say { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); padding: var(--s3) var(--s4); margin-bottom: var(--s3); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-2); }
+.fd-say > span { display: flex; flex-direction: column; gap: 2px; }
+.fd-say small { color: var(--text-3); font-size: var(--fs-sm); }
+.fd-gnote { color: var(--warn, var(--accent)); font-size: var(--fs-sm); }
 .fd-race summary { display: flex; align-items: center; gap: var(--s3); cursor: pointer; list-style: none; }
 .fd-race summary::-webkit-details-marker { display: none; }
 .fd-race summary > div { flex: 1; display: flex; flex-direction: column; min-width: 0; }

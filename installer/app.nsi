@@ -74,6 +74,11 @@ Section "${PRODUCT}" SecApp
     CreateShortcut "$SMPROGRAMS\${PRODUCT} - Set up adapters.lnk" "$INSTDIR\driver\setup-adapters.cmd" "" "$INSTDIR\${EXE}"
   !endif
 
+  ; Windows Firewall: let other devices reach the app (phones, feed nodes on TCP 8090, their UDP 8091 announcements).
+  ; Private and domain networks only, like the "allow" Windows offers; replaced on every install, removed on uninstall.
+  nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall delete rule name="${PRODUCT}"'
+  nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall add rule name="${PRODUCT}" dir=in action=allow program="$INSTDIR\${EXE}" profile=private,domain enable=yes'
+
   WriteRegStr HKLM "Software\${PRODUCT}" "InstallDir" "$INSTDIR"
   WriteRegStr HKLM "${UNKEY}" "DisplayName" "${PRODUCT}"
   WriteRegStr HKLM "${UNKEY}" "DisplayVersion" "${VERSION}"
@@ -143,6 +148,7 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${PRODUCT}.lnk"
   Delete "$SMPROGRAMS\${PRODUCT} - Set up adapters.lnk"
   Delete "$DESKTOP\${PRODUCT}.lnk"
+  nsExec::ExecToLog '"$SYSDIR\netsh.exe" advfirewall firewall delete rule name="${PRODUCT}"'
   DeleteRegKey HKLM "${UNKEY}"
   DeleteRegKey HKLM "Software\${PRODUCT}"
 SectionEnd

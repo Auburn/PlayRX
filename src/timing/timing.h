@@ -55,7 +55,7 @@ public:
 
   // JSON for the web pages
   std::string levels_json(int slot, double since_s, int max_points);
-  // Feed node: the raw levels newer than since_s (at most the last ~20 s), oldest first
+  // Feed node: the raw levels newer than since_s (at most the last ~40 s), oldest first
   std::vector<LevelPoint> levels_since(int slot, double since_s);
   std::string config_json(int slot);
   bool config_from_json(int slot, const std::string &body);  // partial updates: only the keys present
@@ -65,7 +65,7 @@ private:
     std::mutex m;
     GateConfig cfg;
     uint64_t cfg_ver = 0;
-    std::deque<LevelPoint> hist;   // the last ~20 s, for the graph
+    std::deque<LevelPoint> hist;   // the last ~40 s, for the graph (shows up to 30 s)
     double sp_centre = 0, sp_fs = 0, sp_pilot = 0;
     std::vector<float> sp_db;
     uint64_t sp_seq = 0;
