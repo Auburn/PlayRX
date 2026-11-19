@@ -219,3 +219,71 @@ index 69c6cb3..0b04054 100644
    double late_max_us = 0, ship_max_us = 0, end_max_us = 0;
    double wall_s = 0;
    std::string error;       // empty unless the stream stopped on a fault
+diff --git a/src/usbmode.cpp b/src/usbmode.cpp
+index 4c09dbb..6994181 100644
+--- a/src/usbmode.cpp
++++ b/src/usbmode.cpp
+@@ -36,11 +36,12 @@ std::string port_path(libusb_device *d) {
+ } // namespace
+ 
+ namespace {
+-Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail);
++Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail, bool force = false);
+ 
+ // The switch both ways: halmac's set_usb_mode_88xx (PAD_CTRL2 USB23_SW_MODE 2 = USB 3, 1 = USB 2), which
+ // rtw88 uses for USB 2 -> 3 (plus its 0x10C3 write) and the vendor driver also for 3 -> 2.
+-Usb3Switch request_mode(uint16_t pid, int bus, const std::string &port, bool usb3, std::string *detail) {
++Usb3Switch request_mode(uint16_t pid, int bus, const std::string &port, bool usb3, std::string *detail,
++                        bool force = false) {
+   const auto fail = [&](const std::string &why) {
+     if (detail)
+       *detail = why;
+@@ -73,10 +74,10 @@ Usb3Switch request_mode(uint16_t pid, int bus, const std::string &port, bool usb
+   if (const int rc = libusb_open(dev, &h); rc != 0)
+     return fail(std::string("open: ") + libusb_error_name(rc));
+   std::unique_ptr<libusb_device_handle, void (*)(libusb_device_handle *)> h_guard(h, libusb_close);
+-  return switch_mode(h, usb3, detail);
++  return switch_mode(h, usb3, detail, force);
+ }
+ 
+-Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail) {
++Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail, bool force) {
+   const auto fail = [&](const std::string &why) {
+     if (detail)
+       *detail = why;
+@@ -98,7 +99,7 @@ Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail)
+     pad = r.r32(0xc4);
+     if (!(pad & ((3u << 18) | (1u << 20)))) // USB23_SW_MODE / USB3_USB2_TRANSITION
+       return Usb3Switch::Unsupported;
+-    if (usb3 && ((pad >> 18) & 3) == 2)
++    if (usb3 && ((pad >> 18) & 3) == 2 && !force)
+       return Usb3Switch::AlreadyTried;
+     if (usb3)
+       r.w8(0x10c3, static_cast<uint8_t>(r.r8(0x10c3) & ~1u));
+@@ -120,8 +121,8 @@ Usb3Switch switch_mode(libusb_device_handle *h, bool usb3, std::string *detail)
+ }
+ } // namespace
+ 
+-Usb3Switch request_usb3(uint16_t pid, int bus, const std::string &port, std::string *detail) {
+-  return request_mode(pid, bus, port, true, detail);
++Usb3Switch request_usb3(uint16_t pid, int bus, const std::string &port, std::string *detail, bool force) {
++  return request_mode(pid, bus, port, true, detail, force);
+ }
+ 
+ Usb3Switch request_usb3_fd(int sys_fd, std::string *detail) {
+diff --git a/src/usbmode.h b/src/usbmode.h
+index 7fa3610..b52e81e 100644
+--- a/src/usbmode.h
++++ b/src/usbmode.h
+@@ -22,7 +22,10 @@ enum class Usb3Switch {
+ const char *usb3_switch_name(Usb3Switch r);
+ 
+ // The adapter at bus/port (port path "1" or "1.2"). Opens it briefly; nothing else may hold it.
+-Usb3Switch request_usb3(uint16_t pid, int bus, const std::string &port, std::string *detail = nullptr);
++// force (Play League): switch even when the chip looks like it already tried (USB23_SW_MODE already 2). A chip
++// can power up that way without having tried (seen on a Mac); a link without USB 3 lines just comes back at USB 2.
++Usb3Switch request_usb3(uint16_t pid, int bus, const std::string &port, std::string *detail = nullptr,
++                        bool force = false);
+ // Back to USB 2 without a replug (the vendor driver's 3 -> 2 switch; tests of the USB 2 paths). The
+ // chip then comes up at USB 2, and request_usb3 can switch it again.
+ Usb3Switch request_usb2(uint16_t pid, int bus, const std::string &port, std::string *detail = nullptr);

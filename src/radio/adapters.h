@@ -11,6 +11,7 @@ struct AdapterInfo {
   std::string port;  // port path, "3" or "3.1"
   uint16_t vid = 0, pid = 0;
   bool superspeed = false;
+  bool speed_known = true;  // false: libusb could not tell (Apple silicon ports); superspeed is then a guess
   std::string name;  // for the UI: "TP-Link Archer T4U v3" / "RTL8812BU"
   // Stable while it stays in the same socket: "bus-port".
   std::string id() const { return std::to_string(bus) + "-" + port; }

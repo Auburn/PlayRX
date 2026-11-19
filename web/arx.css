@@ -123,7 +123,7 @@ h3 { font-size: var(--fs-sm); color: var(--text-2); font-weight: 600; letter-spa
 /* full screen video: the shell steps aside */
 body.immersive .app { grid-template-columns: 0 minmax(0, 1fr); grid-template-rows: 0 minmax(0, 1fr); }
 body.immersive .topbar, body.immersive .sidebar { display: none; }
-body.immersive .main { padding: 0; }
+body.immersive .main { padding: 0; grid-column: 2; grid-row: 2; }  /* keep its cell: with the bars hidden it would drop into the 0-wide one */
 body.immersive .view-head { display: none; }
 
 /* ---------- cards ---------- */
@@ -226,6 +226,34 @@ body.immersive .view-head { display: none; }
   color: var(--text-2); text-shadow: 0 1px 4px #000; pointer-events: none;
 }
 .tile-foot { position: absolute; left: var(--s3); bottom: var(--s2); display: flex; gap: var(--s2); }
+/* top right of each feed: its channel and a full-screen button (lap times move to the bottom right) */
+.tile-ctl { position: absolute; top: var(--s2); right: var(--s2); display: flex; gap: 6px; z-index: 2; cursor: default; }
+.tile-ctl .select, .tile-ctl .btn {
+  height: 30px; background: rgba(0, 0, 0, .55); color: #fff; border-color: rgba(255, 255, 255, .25); backdrop-filter: blur(4px);
+}
+.tile-ctl .select { width: auto; min-width: 0; padding: 0 6px; font-size: var(--fs-sm); }
+.tile-ctl .select option { background: var(--surface); color: var(--text); }
+.tile-ctl .btn-icon { width: 30px; }
+.tile-ctl .btn-icon svg { width: 16px; height: 16px; }
+.tile-ctl .select:hover, .tile-ctl .btn:hover { background: rgba(0, 0, 0, .8); border-color: rgba(255, 255, 255, .5); }
+.tile .tile-laps { top: auto; bottom: 0; }
+#live-add { width: auto; }
+/* one feed in full screen: edge to edge, no frame, no rounding, the controls fade until the mouse moves over it */
+body.immersive .main { overflow: hidden; }
+.tiles.solo { display: block; }
+/* several feeds in full screen: rows centred on the screen, the last (short) row centred too */
+.tiles.wall:not(.solo) {
+  display: flex; flex-wrap: wrap; justify-content: center; align-content: center; gap: 8px;
+  margin: 0 auto; padding: 8px 0; box-sizing: content-box; height: calc(100vh - 16px);  /* 8 px edge, like the gaps */
+}
+.tiles.wall:not(.solo) .tile { width: var(--tw); flex: none; }
+.tiles.solo .tile:not([hidden]) {
+  position: fixed; inset: 0; width: 100vw; height: 100vh; aspect-ratio: auto; border-radius: 0; box-shadow: none; z-index: 50;
+}
+@media (hover: hover) {
+  .tiles.solo .tile-ctl { opacity: 0; transition: opacity .2s; }
+  .tiles.solo .tile:hover .tile-ctl, .tiles.solo .tile-ctl:focus-within { opacity: 1; }
+}
 
 /* ---------- graphs ---------- */
 canvas.graph { display: block; width: 100%; background: var(--graph-bg); border-radius: var(--r-sm); }

@@ -157,6 +157,7 @@ export function video(slots, canvasFor) {
         g.imageSmoothingEnabled = true;
         g.imageSmoothingQuality = 'high';
         g.drawImage(bmp, 0, 0, w, h);
+        c.dataset.at = performance.now();  // when a picture last arrived (the Live page: "weak", not "no", signal)
         bmp.close();
       } catch { /* a torn frame */ }
       busy.delete(slot);

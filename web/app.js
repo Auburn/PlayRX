@@ -100,13 +100,23 @@ function renderBar() {
     `OBS: <span class="mono">localhost:${st.port}</span>` + (st.feed_error ? `<br><span style="color:var(--bad)">${esc(st.feed_error)}</span>` : '');
 }
 
-function immersive(on) {
-  on = on ?? !document.body.classList.contains('immersive');
+function immersive(on, slot) {
+  const was = document.body.classList.contains('immersive');
+  on = on ?? !was;
   document.body.classList.toggle('immersive', on);
-  if (window.arxFullscreen) window.arxFullscreen();  // the app window: borderless full screen
-  if (on && location.hash.split('/')[1] !== 'live') location.hash = '#/live';
+  if (on !== was) {
+    // the app window: borderless full screen (a native toggle); a browser: the page's own full screen
+    if (window.arxFullscreen) window.arxFullscreen();
+    else if (on) document.documentElement.requestFullscreen?.().catch(() => {});
+    else if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+  }
+  if (on && location.hash.split('/')[1] !== 'live') location.hash = slot ? `#/live/${slot}` : '#/live';
   setTimeout(() => window.dispatchEvent(new Event('resize')), 50);
 }
+// a browser left its own full screen (its Esc): leave the video-only view too
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && !window.arxFullscreen && document.body.classList.contains('immersive')) immersive(false);
+});
 $('#fullscreen').onclick = () => immersive(true);
 // the Discord link: in the app window it opens in the system browser (a browser just opens a new tab)
 $('#nav-discord').addEventListener('click', e => {
@@ -160,35 +170,74 @@ addEventListener('hashchange', route);
 
 // ---- Live: every pilot's video
 views.live = (el, arg) => {
-  let focus = Number(arg) || 0;
+  let focus = Number(arg) || 0, fsFocus = false;  // fsFocus: a tile's full-screen button chose the feed shown alone
   el.innerHTML = `
     <div class="view-head"><h1>Live</h1><span class="sub" id="live-sub"></span><div class="spacer"></div>
-      <span class="faint">Click a feed to show it alone · F11 full screen</span></div>
+      <span class="faint">Click a feed to show it alone · F11 full screen</span>
+      <select class="select" id="live-add" title="Watch a channel: adds a feed on it, no setup needed"></select></div>
     <div class="tiles" id="tiles"></div>`;
+  // the quick way in: pick a channel, get a feed on it (named "Pilot n"; rename it on the Slots / Feeds page later)
+  const addSel = $('#live-add', el);
+  let addSig = '';
+  function fillAdd() {
+    const full = usedSlots().length >= 8;
+    const sig = S.settings.bands.join('') + '/' + S.channels.length + '/' + full;
+    if (sig === addSig || document.activeElement === addSel) return;
+    addSig = sig;
+    addSel.innerHTML = `<option value="">${full ? 'All 8 slots in use' : '+ Watch a channel…'}</option>` + (full ? '' : channelOptions(0).replace(/ selected/g, ''));
+    addSel.value = '';
+    addSel.disabled = full;
+  }
+  addSel.onchange = async () => {
+    if (!addSel.value) return;
+    const ch = chosen(addSel);
+    addSel.value = '';
+    addSel.blur();
+    try { await post('/api/pilots', {name: '', pilot_id: 0, ...ch}); toast(`Watching ${ch.channel}`); await pollState(); }
+    catch (err) { toast(err.status === 409 ? 'All 8 slots are in use' : 'Could not add the feed'); }
+  };
   const tilesEl = $('#tiles', el), tiles = new Map();
   let stream = null, streamKey = '';  // one WebSocket for every tile, reopened when the pilots change
   const tileHtml = n => `<canvas></canvas><div class="tile-cap"><span class="tile-n">${n}</span><span class="tile-name"></span><span class="tile-ch"></span></div>
+    <div class="tile-ctl"><select class="select tile-sel" title="Channel"></select>
+      <button class="btn btn-icon tile-fs" title="Full screen (Esc to leave)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button></div>
     <div class="tile-laps"></div><div class="tile-msg"></div><div class="tile-foot"></div>`;
 
   function layout() {
+    if (fsFocus && !document.body.classList.contains('immersive')) { fsFocus = false; focus = 0; return update(); }  // left full screen: back to every feed
     const shown = [...tiles.values()].filter(t => !t.hidden);
     const n = shown.length;
     if (!n) return;
-    const box = el.getBoundingClientRect(), immersiveOn = document.body.classList.contains('immersive');
-    const W = tilesEl.clientWidth, H = (immersiveOn ? innerHeight : innerHeight - tilesEl.getBoundingClientRect().top - 24);
+    // full screen on one feed: it fills the screen edge to edge (the picture keeps its shape)
+    const solo = document.body.classList.contains('immersive') && n === 1;
+    tilesEl.classList.toggle('solo', solo);
+    if (solo) { tilesEl.style.gridTemplateColumns = ''; tilesEl.style.width = ''; return; }
+    const immersiveOn = document.body.classList.contains('immersive');
+    // full screen: an 8 px edge all round, the same as the gap between feeds
+    const W = immersiveOn ? innerWidth - 16 : tilesEl.clientWidth, H = (immersiveOn ? innerHeight - 16 : innerHeight - tilesEl.getBoundingClientRect().top - 24);
     let best = 1, bw = 0;
     for (let c = 1; c <= n; c++) {
       const r = Math.ceil(n / c), w = Math.min((W - (c - 1) * 8) / c, ((H - (r - 1) * 8) / r) * 4 / 3);
       if (w > bw) { bw = w; best = c; }
     }
-    tilesEl.style.gridTemplateColumns = `repeat(${best}, ${Math.floor(bw)}px)`;
+    // full screen, several feeds: a wall centred both ways, a short last row centred under the others
+    tilesEl.classList.toggle('wall', immersiveOn);
+    const tw = Math.floor(bw);
+    if (immersiveOn) {
+      tilesEl.style.gridTemplateColumns = '';
+      tilesEl.style.width = `${best * tw + (best - 1) * 8}px`;
+      tilesEl.style.setProperty('--tw', `${tw}px`);
+      return;
+    }
+    tilesEl.style.width = '';
+    tilesEl.style.gridTemplateColumns = `repeat(${best}, ${tw}px)`;
     tilesEl.style.justifyContent = 'center';
-    void box;
   }
   addEventListener('resize', layout);
 
   function update() {
     const slots = usedSlots();
+    fillAdd();
     $('#live-sub', el).textContent = slots.length ? `${slots.length} ${isRx() ? 'feed' : 'pilot'}${slots.length > 1 ? 's' : ''}` : '';
     const want = new Set(slots.map(s => s.slot));
     for (const [n, t] of tiles) if (!want.has(n)) { t.remove(); tiles.delete(n); }
@@ -205,19 +254,41 @@ views.live = (el, arg) => {
         t.className = 'tile';
         t.innerHTML = tileHtml(s.slot);
         t.onclick = () => { focus = focus === s.slot ? 0 : s.slot; update(); };
+        const ctl = t.querySelector('.tile-ctl'), sel = t.querySelector('.tile-sel');
+        ctl.onclick = e => e.stopPropagation();  // the controls: not "show this feed alone"
+        sel.onchange = async () => {
+          const ch = chosen(sel);
+          sel.blur();
+          try { await post(`/api/pilots/${s.slot}`, ch); toast(`Feed ${s.slot} → ${ch.channel}`); await pollState(); }
+          catch { toast('Could not change the channel'); }
+        };
+        t.querySelector('.tile-fs').onclick = () => {
+          if (document.body.classList.contains('immersive') && focus === s.slot) { immersive(false); layout(); return; }
+          if (focus !== s.slot) fsFocus = true;  // the grid comes back when full screen ends
+          focus = s.slot;
+          immersive(true);
+          update();
+        };
         tiles.set(s.slot, t);
         tilesEl.append(t);
       }
+      const sel = t.querySelector('.tile-sel'), selSig = s.channel + '/' + Math.round(s.mhz) + '/' + S.settings.bands.join('') + '/' + S.channels.length;
+      if (sel.dataset.sig !== selSig && document.activeElement !== sel) { sel.dataset.sig = selSig; sel.innerHTML = channelOptions(s.mhz, s.channel); }
       t.hidden = focus && focus !== s.slot && want.has(focus);
       t.querySelector('.tile-name').textContent = s.name;
       t.querySelector('.tile-ch').textContent = `${s.channel} ${Math.round(s.mhz)}`;
       const msg = {no_signal: 'NO SIGNAL', opening: 'OPENING ADAPTER', no_adapter: 'NO ADAPTER', error: 'ADAPTER ERROR', timing: 'TIMING ONLY', rotorhazard: 'ROTORHAZARD TIMING', usb_wait: 'NO USB PICTURE', usb_error: 'USB VIDEO ERROR'}[s.state] || '';
-      t.querySelector('.tile-msg').textContent = msg;
+      // not locked, but pictures still arriving (a weak or breaking-up signal): don't cover them with "NO SIGNAL"
+      const pics = performance.now() - Number(t.querySelector('canvas').dataset.at || -1e9) < 1500;
+      const weak = s.state === 'no_signal' && pics;
+      t.querySelector('.tile-msg').textContent = weak ? '' : msg;
       const r = raceOf(s.slot);
-      t.querySelector('.tile-foot').innerHTML = s.state === 'locked' ? `<span class="pill pill-good">${s.fps} fps</span>` : '';
+      const foot = s.state === 'locked' ? `<span class="pill pill-good">${s.fps} fps</span>` : weak ? '<span class="pill pill-warn" title="The receiver is not locked onto this picture: move closer, or check the channel">Weak signal</span>' : '';
+      const fe = t.querySelector('.tile-foot');
+      if (fe.innerHTML !== foot) fe.innerHTML = foot;
     }
     if (!slots.length && !$('.empty', el)) tilesEl.insertAdjacentHTML('beforebegin',
-      `<div class="card empty"><b>No pilots yet</b>Add pilots on the <a href="#/pilots">Pilots</a> page: a name and a channel each.</div>`);
+      `<div class="card empty"><b>Nothing to watch yet</b>Pick a channel from <b>+ Watch a channel</b> (top right) to see it straight away, or set up named ${isRx() ? 'feeds on the <a href="#/pilots">Feeds</a>' : 'pilots on the <a href="#/pilots">Slots</a>'} page.</div>`);
     if (slots.length) $('.empty', el)?.remove();
     layout();
   }

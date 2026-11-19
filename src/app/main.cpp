@@ -1173,13 +1173,26 @@ void refresh_adapters() {
     static std::set<std::string> tried;
     const auto now_list = arx::list_adapters();
     const size_t before = now_list.size();
+    // a port whose adapter is gone is asked again next time: a replug brings the adapter back at USB 2
+    for (auto it = tried.begin(); it != tried.end();)
+      it = std::none_of(now_list.begin(), now_list.end(), [&](const arx::AdapterInfo &a) { return a.id() == *it; })
+               ? tried.erase(it) : std::next(it);
     int asked = 0;
     for (const auto &a : now_list) {
-      if (a.superspeed || tried.count(a.id())) continue;
+      // speed unknown (Apple silicon): ask anyway; the switch checks the chip's own mode and leaves USB 3 alone
+      if ((a.superspeed && a.speed_known) || tried.count(a.id())) continue;
       tried.insert(a.id());
       std::string detail;
-      const auto r = wsdr::request_usb3(wsdr::kPid8812bu, a.bus, a.port, &detail);
+      auto r = wsdr::request_usb3(wsdr::kPid8812bu, a.bus, a.port, &detail);
       log += a.id() + ": usb3 switch " + wsdr::usb3_switch_name(r) + (detail.empty() ? "" : " - " + detail) + "\n";
+      // "already tried" can be how a chip powers up (seen on a Mac, right after a replug): switch anyway, once per
+      // port while the app runs (not again on every replug: a link without USB 3 lines would bounce for ever)
+      static std::set<std::string> forced;
+      if (r == wsdr::Usb3Switch::AlreadyTried && forced.insert(a.id()).second) {
+        detail.clear();
+        r = wsdr::request_usb3(wsdr::kPid8812bu, a.bus, a.port, &detail, true);
+        log += a.id() + ": usb3 switch (forced) " + wsdr::usb3_switch_name(r) + (detail.empty() ? "" : " - " + detail) + "\n";
+      }
       if (r == wsdr::Usb3Switch::Requested) asked++;
     }
     std::vector<arx::AdapterInfo> list;
@@ -2540,6 +2553,7 @@ int main(int argc_in, char **argv_in) {
 #else
     void *top = w.window().value();  // the NSWindow
     mac_window_setup(top, kProduct);  // menus (Edit: copy / paste in the page), a sensible minimum size
+    if (auto wv = w.widget(); wv.ok()) mac_webview_dialogs(wv.value());  // the page's confirm() / prompt() / alert()
     w.bind("arxFullscreen", [top](const std::string &) -> std::string { return mac_toggle_fullscreen(top) ? "true" : "false"; });
     // the OBS password for scene switching: only the app window can read it; settings live on the engine thread
     w.bind("arxObsPassword", [](const std::string &) -> std::string {
