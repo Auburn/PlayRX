@@ -4,7 +4,7 @@
 // kepyur radio: one RTL8812BU (wifi-sdr Receiver) + a DSP thread. Modes:
 //   scan   - sweep the analog FPV bands at 40 MS/s, list pilots (humps that pass a sync check)
 //   watch  - tune to one pilot and decode its video (frames to the FrameSink)
-//   test   - stream at a given rate and only count banks (USB/controller soak, no DSP)
+//   timing - no video: the signal level of up to 3 neighbouring channels, for lap timing (AnalogRX)
 // The Receiver's sink only copies banks into a queue (wifi-sdr rule); everything else runs on the DSP thread.
 #pragma once
 #include <atomic>
@@ -38,7 +38,8 @@ struct Pilot {
 
 class Radio {
 public:
-  explicit Radio(FrameSink frames);
+  // lines (AnalogRX low latency): every picture line as it is drawn, on the decoding thread (empty = none)
+  explicit Radio(FrameSink frames, LineSink lines = {});
   ~Radio();
   Radio(const Radio &) = delete;
   Radio &operator=(const Radio &) = delete;
@@ -52,7 +53,6 @@ public:
 
   void scan();                 // then watch the previous pilot again, or the strongest found
   void watch(double hz);
-  void stream_test(int rate_sel, double seconds);
   void idle();
   // AnalogRX timing only: no video; the signal level of each of these channels (up to kMaxTimed, all within
   // ~64 MHz of each other) for lap timing. One channel: 20 MS/s, the whole band's power (like watch). Several:
@@ -72,13 +72,15 @@ public:
   // AnalogRX: two-antenna video: true = paths A and B combined before demodulation (combine.h), false = A only.
   // Takes effect at once (no retune).
   void set_combine(bool on);
+  // AnalogRX low latency (this radio feeds the low latency window): whole pictures built on a thread of their own,
+  // the bank and decode queues kept short (a backlog is dropped, not drawn late) and the USB, DSP and decode threads
+  // in the "Pro Audio" class (Windows). Takes effect at once.
+  void set_low_latency(bool on) { _lowlat = on; }
+  bool is_idle();  // idle() and nothing since
   struct ComboStatus {
     bool on = false;
     arx::Combiner::Stats s;  // the last second
   };
-  ComboStatus combine_status();
-  // Debug: save the next `seconds` of watched IQ as PREFIX.cs16 + PREFIX.json (kp_replay reads them).
-  void record(double seconds, const std::string &prefix);
 
   std::string status_json();   // for the UI (polled)
   std::vector<Pilot> pilots();
@@ -103,7 +105,7 @@ public:
   double gain_db();  // < 0: the chip's AGC
 
 private:
-  enum class Mode { Idle, Scan, Watch, Test, Timing };
+  enum class Mode { Idle, Scan, Watch, Timing };
   struct Bank {
     std::vector<uint8_t> data;
     uint64_t seq;
@@ -117,15 +119,17 @@ private:
   void on_bank(const uint8_t *b, size_t n, uint64_t seq, uint32_t gen, double fs, double centre, double shift);
   void tune(double hz, int rate_sel, bool watching = false);
   void handle_watch(Bank &b);
-  void record_bank(const Bank &b);
   void handle_scan(Bank &b);
-  void handle_test(Bank &b);
   void handle_timing(Bank &b);
   void scan_step_done();
   void unpack(const Bank &b, std::vector<cf> &out);
   void unpack_b(const Bank &b, std::vector<cf> &out);  // path B
 
   FrameSink _frames;
+  LineSink _lines;
+  std::atomic<bool> _lowlat{false};
+  double _dec_t = 0;  // decode thread: arrival of the block being decoded (stamped on its lines)
+  void lowlat_thread();  // the calling thread into / out of the Pro Audio class as _lowlat changes
   std::unique_ptr<wsdr::Receiver> _rx;
   mutable std::mutex _m;  // mode, pilots, status fields below
   Mode _mode = Mode::Idle;
@@ -135,13 +139,6 @@ private:
   int _watch_rate = 1;
   double _gain_db = -1;
   bool _offset = true;
-  // recording (DSP thread writes; the request is under _m)
-  double _rec_req_s = 0;
-  std::string _rec_req_prefix;
-  FILE *_rec = nullptr, *_rec_b = nullptr;  // path A (PREFIX.cs16) and B (PREFIX_b.cs16)
-  std::string _rec_prefix;
-  uint64_t _rec_left = 0, _rec_samples = 0;
-  double _rec_fs = 0, _rec_centre = 0, _rec_shift = 0;
   std::vector<Pilot> _pilots;
   bool _superspeed = false, _open = false;
   std::string _chip;
@@ -162,6 +159,7 @@ private:
     std::shared_ptr<FrontEnd> fe;
     std::vector<float> d;
     std::vector<uint8_t> bad;  // sparkle repair marks (empty when it is off)
+    double t_s = 0;            // when its bank arrived from USB (steady clock, s)
   };
   std::thread _decoder;
   std::mutex _dqm;
@@ -193,12 +191,6 @@ private:
   double _cap_centre = 0;
   std::vector<Hump> _humps;  // this step's candidates (from the first kPsdSpan of the capture)  // hardware centre of the capture (humps are measured from it)
   double _resume_hz = 0;
-  // test
-  uint64_t _test_banks = 0, _test_gaps = 0, _test_last_seq = 0, _test_runs = 0;
-  uint32_t _test_gen = 0;
-  int64_t _test_t0_ms = 0, _test_end_ms = 0;
-  double _test_fs = 0;
-  std::string _test_result;
   // load
   double _busy_s = 0, _load = 0;
   int64_t _load_t0_ms = 0;

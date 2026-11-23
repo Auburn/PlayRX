@@ -17,6 +17,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <knownfolders.h>
+#include <io.h>  // _commit
 #else
 // macOS / Linux: the engine loop under Win32's names, Unix process / path calls; macOS also the Cocoa bits
 // (mac_window.mm). Linux (a Raspberry Pi) is headless: no window, the UI only through the browser.
@@ -65,6 +66,7 @@ extern char **environ;
 #include "live_out.h"
 #ifdef _WIN32
 #include "vcam_writer.h"
+#include "lowlat.h"
 #endif
 #include "feed_server.h"
 #include "log.h"
@@ -171,6 +173,13 @@ std::string jstr(const std::string &j, const char *key) {
   }
   return o;
 }
+// Cut UTF-8 text to at most `max` bytes without splitting a character (an accented letter, an emoji) in two
+void utf8_cut(std::string &s, size_t max) {
+  if (s.size() <= max) return;
+  size_t n = max;
+  while (n > 0 && (static_cast<unsigned char>(s[n]) & 0xC0) == 0x80) n--;  // s[n] continues a character: back to its start
+  s.resize(n);
+}
 std::string q(const std::string &s) {  // JSON string literal
   std::string o = "\"";
   for (char c : s) {
@@ -208,7 +217,7 @@ struct Settings {
   std::string precheck = "brief";
   // timing only: no video; each adapter times up to 3 pilots on neighbouring channels (lap timing for more
   // pilots than adapters, and a light load: a Raspberry Pi times 4+ pilots)
-#ifdef __linux__
+#if defined(__linux__) && !defined(ARX_EDITION_RX)  // (Play RX shows video on Linux too)
   bool timing_only = true;  // the Pi: timing only and portable by default (easy to turn off from a PC, hard to turn on from a phone)
 #else
   bool timing_only = false;
@@ -218,7 +227,7 @@ struct Settings {
   bool timing_wide = false;
   // portable mode: a Raspberry Pi taken outside, run from phones (the field page, /field): lap timing only, the
   // voice spoken by the phones. Turning it on also turns timing only on.
-#ifdef __linux__
+#if defined(__linux__) && !defined(ARX_EDITION_RX)
   bool portable = true;
 #else
   bool portable = false;
@@ -228,17 +237,12 @@ struct Settings {
   bool comb = true;         // picture: comb filter (no ringing) vs the classic notch (DecoderOpts::luma_filter via ARX_LUMA)
   int msps = 20;            // receiver sample rate while watching: 20 (robust on Windows USB) or 40 (wider, cleaner)
   bool diversity = false;   // video from both of each adapter's antennas (A + B combined), like diversity goggles
-  // the DVR: every slot recorded all the time (H.264 MP4), oldest deleted past the limit
-  bool dvr_on = true;
-  std::string dvr_dir;      // "" = Videos\Play League (simulator: next to the app)
-  double dvr_max_gb = 100;
-  std::string scene_replay; // the OBS scene the Replay page cuts to
   bool repair = false;      // sparkle repair: FM clicks patched over, badly hit lines kept from the last field
   bool offset_tune = true;  // tune each receiver ~4 MHz beside its pilot (off the chip's DC point: no edge stripes)
   bool acomb = true;        // adaptive comb: clean OSD text (no halo, no rainbow edges); NTSC with the comb filter on
   bool smooth_lines = true; // each field's lines in place, the lines between interpolated (no stair-steps, no bobbing)
   // a race without a heat loaded (Start race on whoever is in the slots): its format
-  std::string quick_mode = "practice";  // practice | laps | timed | best3
+  std::string quick_mode = "laps";  // laps (first to N, the default) | practice | timed | best3
   int quick_laps = 3;
   int quick_time = 120;  // s
   int64_t pin_league = 0;  // the league pinned to the Dashboard (0 none)
@@ -265,6 +269,7 @@ struct Settings {
   std::string node_name;  // what race PCs list it as ("" = the computer name)
   std::string nodes;      // race PC: feed nodes added by hand, "host:port" comma separated
   std::string rh_mode = "laps";  // laps: RH's laps | crossings: RH's raw gate crossings, timed here
+  bool lowlat_solo = false;      // low latency mode: pause the other feeds while it is on
 } g_settings;
 constexpr const char *kAllBands = "ABEFRL";
 
@@ -347,6 +352,7 @@ arx::FeedServer g_feeds;
 arx::LiveOut g_live;  // FPV Trackside / RTMP: every pilot's video as a stream
 #ifdef _WIN32
 arx::VCamWriter g_vcam;  // virtual cameras: every pilot as its own video device ("Play League Pilot 1" ...)
+arx::LowLatWindow g_lowlat;  // low latency mode: one pilot in its own Direct3D window, drawn line by line
 #endif
 arx::Timing g_timing;
 
@@ -392,7 +398,8 @@ struct Slot {
   Rx rx;
   double level_t = 0;        // newest level point handed to g_timing
   uint64_t spec_seq = 0;     // newest spectrum handed over
-  uint64_t cfg_seen = 0;     // g_timing config version already applied / saved
+  uint64_t cfg_seen = 0;     // g_timing config version already applied to the radio (its gain)
+  uint64_t cfg_saved = 0;    // g_timing config version already in pilots.cfg (any slot, with or without a radio)
   double gain_applied = -1;  // the gain the radio runs with (< 0 = AGC)
   // timing only: the slot whose radio times this pilot (itself when it holds the adapter; 0 = not grouped
   // yet) and this pilot's channel in that radio's list
@@ -516,14 +523,6 @@ std::filesystem::path data_dir() {
 #endif
   std::error_code ec;
   std::filesystem::create_directories(d, ec);
-  // first run of this version: bring along what an older build kept next to the exe
-  const std::filesystem::path old(exe_dir());
-  for (const wchar_t *n : {L"pilots.cfg", L"settings.cfg", L"league.db", L"league.db-wal", L"league.db-shm", L"playrx_feeds.cfg",
-                           L"playrx_settings.cfg", L"backups"}) {
-    const auto from = old / n, to = d / n;
-    if (std::filesystem::exists(from, ec) && !std::filesystem::exists(to, ec))
-      std::filesystem::copy(from, to, std::filesystem::copy_options::recursive, ec);
-  }
   return d;
 }
 std::filesystem::path config_path() {
@@ -535,31 +534,60 @@ std::filesystem::path settings_path() {
   return data_dir() / (g_app.sim ? L"settings_sim.cfg" : L"settings.cfg");
 }
 
+// A whole file written safely: into a temporary file next to it, flushed to the disk, then swapped in. A power cut
+// mid-write (the Pi is switched off by pulling the plug) leaves the old file, never an empty one.
+bool write_file_safe(const std::filesystem::path &to, const std::string &text) {
+  std::filesystem::path tmp = to;
+  tmp += L".tmp";
+#ifdef _WIN32
+  FILE *f = _wfopen(tmp.wstring().c_str(), L"wb");
+#else
+  FILE *f = std::fopen(tmp.string().c_str(), "wb");
+#endif
+  if (!f) return false;
+  bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size() && std::fflush(f) == 0;
+#ifdef _WIN32
+  ok = ok && _commit(_fileno(f)) == 0;
+#else
+  ok = ok && fsync(fileno(f)) == 0;
+#endif
+  ok = std::fclose(f) == 0 && ok;
+  if (ok) {
+#ifdef _WIN32
+    ok = MoveFileExW(tmp.wstring().c_str(), to.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    ok = std::rename(tmp.string().c_str(), to.string().c_str()) == 0;
+#endif
+  }
+  if (!ok) {
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    KP_LOGW("could not save %s", narrow(to.wstring()).c_str());
+  }
+  return ok;
+}
+
 void save_settings() {
   const Settings &s = g_settings;
-  std::ofstream f(settings_path());
+  std::ostringstream f;
   f << "# AnalogRX settings\nbands=" << s.bands << "\nlan=" << s.lan << "\nguided=" << s.guided << "\nauto_gate=" << s.auto_gate << "\npasses=" << s.passes
     << "\nvoice=" << s.voice << "\nvolume=" << s.volume << "\nrate=" << s.rate << "\npitch=" << s.pitch << "\nvoice_id=" << s.voice_id << "\nprecheck=" << s.precheck << "\ntiming_only=" << s.timing_only << "\nts_on=" << s.ts_on << "\nts_host=" << s.ts_host << "\nts_port=" << s.ts_port << "\nts_fps=" << s.ts_fps << "\nts_kbps=" << s.ts_kbps << "\nts_bars=" << s.ts_bars << "\nvcam_mask=" << s.vcam_mask << "\ntiming_wide=" << s.timing_wide << "\nportable=" << s.portable << "\ncall_laps=" << s.call_laps << "\nmsps=" << s.msps << "\ndiversity=" << s.diversity << "\nrepair=" << s.repair << "\noffset_tune=" << s.offset_tune << "\nacomb=" << s.acomb << "\nsmooth_lines=" << s.smooth_lines << "\ncomb=" << s.comb << "\nquick_mode=" << s.quick_mode << "\nquick_laps=" << s.quick_laps
     << "\nquick_time=" << s.quick_time << "\npin_league=" << s.pin_league << "\nobs_on=" << s.obs_on << "\nobs_url=" << s.obs_url << "\nobs_pass=" << s.obs_pass
-    << "\ndvr_on=" << s.dvr_on << "\ndvr_dir=" << s.dvr_dir << "\ndvr_max_gb=" << s.dvr_max_gb << "\nscene_replay=" << s.scene_replay
     << "\nscene_pre=" << s.scene_pre << "\nscene_race=" << s.scene_race << "\nscene_results=" << s.scene_results
     << "\nrh_on=" << s.rh_on << "\nrh_url=" << s.rh_url << "\nrh_user=" << s.rh_user << "\nrh_pass=" << s.rh_pass << "\nrh_sync=" << s.rh_sync
     << "\nrh_control=" << s.rh_control << "\nrh_mode=" << s.rh_mode << "\nnode_mode=" << s.node_mode << "\nnode_name=" << s.node_name
-    << "\nnodes=" << s.nodes << "\npi_defaults=1\n";
+    << "\nnodes=" << s.nodes << "\nlowlat_solo=" << s.lowlat_solo << "\n";
+  write_file_safe(settings_path(), f.str());
 }
 
 void load_settings() {
   std::ifstream f(settings_path());
-  const bool had_file = f.good();
-  bool pi_defaults = false;  // settings saved by 0.9.2.36 or later (the Pi's portable defaults already applied once)
   std::string line;
   while (std::getline(f, line)) {
     const size_t eq = line.find('=');
     if (line.empty() || line[0] == '#' || eq == std::string::npos) continue;
     const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
-    if (k == "pi_defaults") {
-      pi_defaults = true;
-    } else if (k == "bands") {
+    if (k == "bands") {
       std::string b;
       for (char c : std::string(kAllBands))
         if (v.find(c) != std::string::npos) b += c;
@@ -640,20 +668,12 @@ void load_settings() {
       g_settings.scene_race = v;
     } else if (k == "scene_results") {
       g_settings.scene_results = v;
-    } else if (k == "scene_replay") {
-      g_settings.scene_replay = v;
     } else if (k == "node_mode") {
       g_settings.node_mode = v == "1";
     } else if (k == "node_name") {
       g_settings.node_name = v;
     } else if (k == "nodes") {
       g_settings.nodes = v;
-    } else if (k == "dvr_on") {
-      g_settings.dvr_on = v == "1";
-    } else if (k == "dvr_dir") {
-      g_settings.dvr_dir = v;
-    } else if (k == "dvr_max_gb") {
-      g_settings.dvr_max_gb = std::clamp(std::atof(v.c_str()), 1.0, 100000.0);
     } else if (k == "rh_on") {
       g_settings.rh_on = v == "1";
     } else if (k == "rh_url") {
@@ -668,18 +688,10 @@ void load_settings() {
       g_settings.rh_control = v == "1";
     } else if (k == "rh_mode") {
       g_settings.rh_mode = v == "crossings" ? "crossings" : "laps";
+    } else if (k == "lowlat_solo") {
+      g_settings.lowlat_solo = v == "1";
     }
   }
-#ifdef __linux__
-  // a Pi set up before 0.9.2.36: portable mode + timing only on once (later turning them off from a PC sticks)
-  if (!kRx && had_file && !pi_defaults && !g_settings.portable) {
-    g_settings.portable = g_settings.timing_only = g_settings.lan = true;
-    KP_LOGI("portable mode on (the Pi's default since 0.9.2.36)");
-    save_settings();
-  }
-#else
-  (void)had_file, (void)pi_defaults;
-#endif
 }
 
 std::string settings_json() {
@@ -695,7 +707,7 @@ std::string settings_json() {
     << ",\"quick_laps\":" << s.quick_laps << ",\"quick_time\":" << s.quick_time << ",\"pin_league\":" << s.pin_league << ",\"obs_on\":" << b(s.obs_on)
     << ",\"ts_on\":" << b(s.ts_on) << ",\"ts_host\":" << q(s.ts_host) << ",\"ts_port\":" << s.ts_port << ",\"ts_fps\":" << s.ts_fps << ",\"ts_kbps\":" << s.ts_kbps << ",\"ts_bars\":" << b(s.ts_bars) << ",\"vcam_mask\":" << s.vcam_mask
     << ",\"obs_url\":" << q(s.obs_url) << ",\"obs_pass_set\":" << b(!s.obs_pass.empty()) << ",\"scene_pre\":" << q(s.scene_pre)
-    << ",\"scene_race\":" << q(s.scene_race) << ",\"scene_results\":" << q(s.scene_results) << ",\"scene_replay\":" << q(s.scene_replay)
+    << ",\"scene_race\":" << q(s.scene_race) << ",\"scene_results\":" << q(s.scene_results)
     << ",\"rh_on\":" << b(s.rh_on)
     << ",\"rh_url\":" << q(s.rh_url) << ",\"rh_user\":" << q(s.rh_user) << ",\"rh_pass_set\":" << b(!s.rh_pass.empty())
     << ",\"rh_sync\":" << b(s.rh_sync) << ",\"rh_control\":" << b(s.rh_control) << ",\"rh_mode\":" << q(s.rh_mode)
@@ -791,7 +803,7 @@ void apply_settings(const std::string &body) {
   auto line = [](std::string v) {  // one line in settings.cfg
     for (char &c : v)
       if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-    if (v.size() > 200) v.resize(200);
+    utf8_cut(v, 200);
     return v;
   };
   if (jhas(body, "obs_on")) s.obs_on = jbool(body, "obs_on");
@@ -803,7 +815,6 @@ void apply_settings(const std::string &body) {
   if (jhas(body, "scene_pre")) s.scene_pre = line(jstr(body, "scene_pre"));
   if (jhas(body, "scene_race")) s.scene_race = line(jstr(body, "scene_race"));
   if (jhas(body, "scene_results")) s.scene_results = line(jstr(body, "scene_results"));
-  if (jhas(body, "scene_replay")) s.scene_replay = line(jstr(body, "scene_replay"));
   if (jhas(body, "node_mode") && jbool(body, "node_mode") != s.node_mode) {
     s.node_mode = jbool(body, "node_mode");
     if (s.node_mode) s.lan = true;  // a race PC must be able to reach it (applies at the next start if it was off)
@@ -860,7 +871,7 @@ void apply_settings(const std::string &body) {
 }
 
 void save_pilots() {
-  std::ofstream f(config_path());
+  std::ostringstream f;
   f << "# AnalogRX pilots: slot<TAB>name<TAB>MHz<TAB>timing input (0 A, 1 B, 2 best)<TAB>enter dB<TAB>exit dB<TAB>min lap s"
        "<TAB>smoothing ms<TAB>gain dB (-1 AGC)<TAB>channel<TAB>threshold mode (0 fixed, 1 relative)<TAB>rise dB<TAB>hysteresis dB"
        "<TAB>pilot list id (0 none)<TAB>chosen adapter (USB port, empty = auto)<TAB>video device (empty = the adapter)\n";
@@ -872,16 +883,18 @@ void save_pilots() {
         << g_app.slots[i]->channel << "\t" << c.mode << "\t" << c.rise_db << "\t" << c.hyst_db << "\t"
         << g_app.slots[i]->pilot_id << "\t" << g_pin[i] << "\t" << g_vsrc[i] << "\n";
     }
+  write_file_safe(config_path(), f.str());
 }
 
 std::filesystem::path adapters_path() {
   return data_dir() / (kRx ? (g_app.sim ? "playrx_adapters_sim.cfg" : "playrx_adapters.cfg") : (g_app.sim ? "adapters_sim.cfg" : "adapters.cfg"));
 }
 void save_adapter_names() {
-  std::ofstream f(adapters_path());
+  std::ostringstream f;
   f << "# adapter names: USB port<TAB>name\n";
   for (const auto &[id, nm] : g_adapter_names)
     if (!nm.empty()) f << id << "\t" << nm << "\n";
+  write_file_safe(adapters_path(), f.str());
 }
 void load_adapter_names() {
   std::ifstream f(adapters_path());
@@ -919,10 +932,6 @@ void load_pilots() {
         c.mode = std::atoi(col[10].c_str());
         c.rise_db = static_cast<float>(std::atof(col[11].c_str()));
         c.hyst_db = static_cast<float>(std::atof(col[12].c_str()));
-      } else {
-        // a pilot saved before relative thresholds existed: move to the new defaults (best of A/B, relative
-        // to the background); the old fixed enter/exit stay for switching back
-        c.path = 2;
       }
       g_timing.set_config(n, c);
     }
@@ -931,7 +940,7 @@ void load_pilots() {
     g_pin[n] = col.size() >= 15 ? col[14] : "";
     g_vsrc[n] = col.size() >= 16 ? col[15] : "";
     g_ext[n] = !g_vsrc[n].empty();
-    s->cfg_seen = g_timing.config_version(n);
+    s->cfg_seen = s->cfg_saved = g_timing.config_version(n);
     g_app.slots[n] = std::move(s);
   }
 }
@@ -955,7 +964,7 @@ void publish_info(int n) {
   g_feeds.set_info(n, in);
 }
 
-// One picture of slot n (BGRX) to everyone who shows, records or sends it.
+// One picture of slot n (BGRX) to everyone who shows or sends it.
 void slot_frame(int n, const uint8_t *bgrx, int w, int h) {
   g_feeds.push(n, bgrx, w, h);
   g_live.frame(n, bgrx, w, h);  // the same for the Trackside stream (only when it is on)
@@ -982,6 +991,57 @@ kp::FrameSink frame_sink(std::shared_ptr<std::atomic<int>> to) {
     }
     slot_frame(n, bgrx.data(), f.width, f.height);
   };
+}
+
+// The decoder threads' line sink for slot n: each line straight to the low latency window when it shows slot n.
+kp::LineSink line_sink(std::shared_ptr<std::atomic<int>> to) {
+#ifdef _WIN32
+  return [to](const kp::Line &l) {
+    const int n = to->load();
+    if (n < 1 || n != g_lowlat.slot() || parked(n) || ext_video(n)) return;
+    g_lowlat.line(n, l);
+  };
+#else
+  (void)to;
+  return {};
+#endif
+}
+
+// Low latency upkeep (every 250 ms): the shown pilot's radio runs in low latency (see Radio::set_low_latency),
+// every other radio normally; with "pause other feeds" the other radios idle (no demodulating or decoding: their
+// CPU to the low latency pilot) and go back to their channels when it ends.
+
+bool g_solo_idled[kMaxSlots + 1] = {};
+void lowlat_tick() {
+#ifdef _WIN32
+  const int L = g_lowlat.slot();
+  for (int i = 1; i <= kMaxSlots; i++) {
+    Slot *s = g_app.slots[i].get();
+    kp::Radio *r = s && s->rx.radio && !s->rx.opening && s->rx.radio->is_open() ? s->rx.radio.get() : nullptr;
+    if (r) r->set_low_latency(i == L);
+    const bool pause = L && g_settings.lowlat_solo && i != L && r;
+    if (pause) {
+      if (!r->is_idle()) r->idle();
+      if (!g_solo_idled[i]) KP_LOGI("low latency: pilot %d paused", i);
+      g_solo_idled[i] = true;
+    } else if (g_solo_idled[i]) {
+      g_solo_idled[i] = false;
+      if (r) {
+        KP_LOGI("low latency: pilot %d back", i);
+        tune_slot(i);
+      }
+    }
+  }
+  if (g_app.scanner.radio && !g_app.scanner.opening) g_app.scanner.radio->set_low_latency(false);
+#endif
+}
+
+// The low latency window's caption: "Pilot 1 · R4 5865 MHz"
+std::string lowlat_title(int n) {
+  const Slot *s = n >= 1 && n <= kMaxSlots ? g_app.slots[n].get() : nullptr;
+  if (!s) return "Low latency";
+  const std::string ch = s->ch().empty() ? num(s->mhz, 0) + " MHz" : s->ch() + " " + num(s->mhz, 0) + " MHz";
+  return (s->name.empty() ? "Pilot " + std::to_string(n) : s->name) + "  ·  " + ch;
 }
 
 // Capture devices: each slot with one runs it (re-opened 3 s after it fails or is unplugged).
@@ -1060,7 +1120,7 @@ std::string net_format(int n) {
 
 // Feed node: the race PC tunes the gate (it has the Timing page; a node has none), so its gain drives this adapter
 void node_gain(int n, const std::string &body) {
-  if (!jhas(body, "gain_db")) return;  // a race PC from before 0.9.2.51: the gain stays as it is
+  if (!jhas(body, "gain_db")) return;  // no gain sent: it stays as it is
   arx::GateConfig c = g_timing.config(n);
   const double g = jnum(body, "gain_db");
   if (c.gain_db == g) return;
@@ -1217,9 +1277,9 @@ void refresh_adapters() {
   });
 }
 
-void start_open(Rx &rx, const arx::AdapterInfo &a, kp::FrameSink sink, int which) {
+void start_open(Rx &rx, const arx::AdapterInfo &a, kp::FrameSink sink, int which, kp::LineSink lines = {}) {
   if (rx.opener.joinable()) rx.opener.join();
-  rx.radio = std::make_unique<kp::Radio>(std::move(sink));
+  rx.radio = std::make_unique<kp::Radio>(std::move(sink), std::move(lines));
   rx.adapter = a.id();
   rx.error.clear();
   rx.opening = true;
@@ -1360,7 +1420,7 @@ void assign_adapters() {
       if (!a || adapters_in_use().count(a->id())) continue;
       KP_LOGI("pilot %d (%s): its chosen adapter %s", i, s->name.c_str(), adapter_label(a->id()).c_str());
       s->sink->store(i);
-      start_open(s->rx, *a, frame_sink(s->sink), i);
+      start_open(s->rx, *a, frame_sink(s->sink), i, line_sink(s->sink));
       continue;
     }
     // a pilot outranks the scanner: take its adapter if nothing else is free
@@ -1373,7 +1433,7 @@ void assign_adapters() {
     if (!a) continue;
     KP_LOGI("pilot %d (%s): adapter %s", i, s->name.c_str(), a->id().c_str());
     s->sink->store(i);
-    start_open(s->rx, *a, frame_sink(s->sink), i);
+    start_open(s->rx, *a, frame_sink(s->sink), i, line_sink(s->sink));
   }
   // then warm spares: parked slots without a radio, and new parked slots for adapters nobody has, while the
   // scanner is not after one
@@ -1392,7 +1452,7 @@ void assign_adapters() {
     if (!parked(i) || s->rx.opening || s->rx.radio || t < s->rx.retry_ms) continue;
     KP_LOGI("slot %d: spare, warming adapter %s", i, a->id().c_str());
     s->sink->store(i);
-    start_open(s->rx, *a, frame_sink(s->sink), i);
+    start_open(s->rx, *a, frame_sink(s->sink), i, line_sink(s->sink));
   }
 }
 
@@ -1453,7 +1513,7 @@ void start_scan() {
 std::string clean_name(std::string s) {
   for (char &c : s)
     if (c == '\t' || c == '\n' || c == '\r') c = ' ';
-  if (s.size() > 40) s.resize(40);
+  utf8_cut(s, 40);
   return s;
 }
 
@@ -1563,6 +1623,12 @@ void poll_status() {
   for (int i = 1; i <= kMaxSlots; i++) g_live.set_active(i, active(i) && (!g_settings.timing_only || ext_video(i)));
 #ifdef _WIN32
   for (int i = 1; i <= kMaxSlots; i++) g_vcam.set_slot(i, active(i) && (!g_settings.timing_only || ext_video(i)), pilot_name(i));
+  // low latency window: its caption follows the pilot's name and channel; it closes when the pilot goes
+  if (const int L = g_lowlat.slot()) {
+    if (!active(L)) g_lowlat.show(0, "");
+    else g_lowlat.set_title(lowlat_title(L));
+  }
+  lowlat_tick();
 #endif
   capture_tick();
   // look for newly plugged (or unplugged) adapters every 5 s: there is no USB hotplug notice on Windows here
@@ -1605,6 +1671,12 @@ void feed_timing() {
   for (int i = 1; i <= kMaxSlots; i++) {
     Slot *s = g_app.slots[i].get();
     if (!s) continue;
+    // gate settings changed (the tuning view, the gate check): save them, whether or not this slot has a radio of
+    // its own (timed by another slot's adapter, a feed node, RotorHazard, an adapter not plugged in)
+    if (const uint64_t v = g_timing.config_version(i); v != s->cfg_saved) {
+      s->cfg_saved = v;
+      if (!parked(i)) save = true;
+    }
     // timing only, a pilot timed by another slot's adapter: that radio's level for this pilot's channel
     if (g_settings.timing_only && !parked(i) && s->lead != 0 && s->lead != i) {
       const Slot *ls = g_app.slots[s->lead].get();
@@ -1642,11 +1714,10 @@ void feed_timing() {
     }
     if (!timed) r.set_combine(g_settings.diversity);  // Settings -> Diversity (takes effect at once)
     if (r.set_offset_tuning(g_settings.offset_tune)) tune_slot(i);  // Settings -> Tune beside the channel: retune
-    // gate settings changed (on the tuning view): apply the gain, remember to save
+    // gate settings changed (on the tuning view): apply the gain
     const uint64_t v = g_timing.config_version(i);
     if (v != s->cfg_seen) {
       s->cfg_seen = v;
-      save = true;
       const double g = g_timing.config(i).gain_db;
       if (g != s->gain_applied) {
         s->gain_applied = g;
@@ -1817,6 +1888,7 @@ std::string slot_state(const Slot &s) {
     if (!c.running()) return "usb_error";
     return now_ms() - c.last_frame_ms() < 1500 ? "usb_live" : "usb_wait";
   }
+  if (const int n = slot_no(s); n && g_solo_idled[n]) return "paused";  // low latency: "pause other feeds"
   if (rh_only()) return "rotorhazard";
   if (g_settings.timing_only && s.lead > 0 && g_app.slots[s.lead] && g_app.slots[s.lead].get() != &s) {
     const Slot &l = *g_app.slots[s.lead];  // timed by another slot's adapter
@@ -1934,6 +2006,17 @@ std::string state_json() {
     o << (k ? "," : "") << "{\"name\":" << q(p.name) << ",\"mhz\":" << num(p.mhz) << ",\"std\":" << q(p.std_name)
       << ",\"snr\":" << num(p.snr_db) << "}";
   }
+  // low latency window (Windows): which slot it shows (0 = closed) and how it is going
+  std::string lowlat = "{\"supported\":false,\"slot\":0}";
+#ifdef _WIN32
+  {
+    const auto ls = g_lowlat.stats();
+    lowlat = "{\"supported\":true,\"slot\":" + std::to_string(g_lowlat.slot()) + ",\"tearing\":" + (ls.tearing ? "true" : "false") +
+             ",\"fullscreen\":" + (ls.direct ? "true" : "false") + ",\"presents\":" + num(ls.presents_s, 0) +
+             ",\"lines\":" + num(ls.lines_s, 0) + ",\"age_ms\":" + num(ls.age_ms, 2) + ",\"age_max_ms\":" + num(ls.age_max_ms, 2) +
+             ",\"solo\":" + (g_settings.lowlat_solo ? "true" : "false") + ",\"error\":" + q(ls.error) + "}";
+  }
+#endif
   {
     std::lock_guard<std::mutex> l(g_log.m);
     o << "]},\"log_seq\":" << g_log.seq << ",\"trackside\":" << g_live.status_json()
@@ -1942,6 +2025,7 @@ std::string state_json() {
 #else
     << ",\"vcam\":{\"supported\":false,\"error\":\"\"}"
 #endif
+    << ",\"lowlat\":" << lowlat
     << "}";
   }
   return o.str();
@@ -1990,14 +2074,13 @@ const char *content_type(const std::string &path) {
   if (ext == "png") return "image/png";
   if (ext == "ico") return "image/x-icon";
   if (ext == "json") return "application/json";
-  if (ext == "mp4") return "video/mp4";  // keepawake.mp4: the field page keeps a phone's screen on with it
   if (ext == "webmanifest") return "application/manifest+json";
   return "application/octet-stream";
 }
 
 // A file from the web folder (read on every request, so the UI can be edited without a rebuild).
 bool serve_file(const std::string &rel, std::string &type, std::string &out) {
-  if (rel.find("..") != std::string::npos || rel.find(':') != std::string::npos || rel.find('\\') != std::string::npos)
+  if (rel.empty() || rel[0] == '/' || rel.find("..") != std::string::npos || rel.find(':') != std::string::npos || rel.find('\\') != std::string::npos)
     return false;
   std::ifstream f(g_app.web_dir / std::filesystem::path(rel), std::ios::binary);
   if (!f) return false;
@@ -2093,6 +2176,16 @@ bool api(const std::string &method, const std::string &full, const std::string &
     out = g_timing.config_json(n);
     return true;
   }
+  if (get && path == "/api/uiver") {  // the pages' version: OBS sources reload themselves when it changes (an update)
+    long long newest = std::numeric_limits<long long>::min();  // libstdc++'s file clock counts from 2174: times are negative
+    std::error_code ec;
+    for (const auto &f : std::filesystem::directory_iterator(g_app.web_dir, ec)) {
+      const auto t = f.last_write_time(ec);
+      if (!ec) newest = std::max<long long>(newest, static_cast<long long>(t.time_since_epoch().count()));
+    }
+    out = std::string("{\"v\":") + q(std::string(kVersion) + "-" + std::to_string(newest)) + "}";
+    return true;
+  }
   if (get && path == "/api/log") {
     out = log_json(static_cast<uint64_t>(qnum("since", 0)));
     return true;
@@ -2146,25 +2239,33 @@ bool api(const std::string &method, const std::string &full, const std::string &
       for (int i = 1; i <= kMaxSlots; i++) p += (i > 1 ? ",{\"slot\":" : "{\"slot\":") + std::to_string(i) + ",\"laps\":0}";
       out = "{\"id\":0,\"running\":false,\"elapsed_s\":0,\"pilots\":[" + p + "]}";
     };
-  } else if (post && (n = slot_of("/api/record/"))) {
-    // the next `seconds` (default 1) of this pilot's raw IQ -> rec\<name>-<time>.cs16 + .json (diagnostics)
-    fn = [&, n] {
-      Slot *s = g_app.slots[n].get();
-      if (!s || !s->rx.radio || s->rx.opening || !s->rx.radio->is_open()) {
-        status = "409 Conflict";
-        out = "{}";
+  } else if (post && path == "/api/lowlat") {  // {"slot": n}: show pilot n in the low latency window; 0 closes it
+    fn = [&] {
+#ifdef _WIN32
+      const int n = static_cast<int>(jnum(body, "slot"));
+      if (jhas(body, "solo")) {
+        g_settings.lowlat_solo = jbool(body, "solo");
+        save_settings();
+        KP_LOGI("low latency: other feeds %s", g_settings.lowlat_solo ? "paused while it is on" : "keep running");
+      }
+      if (!jhas(body, "slot")) {  // just the switch
+        lowlat_tick();
+        out = "{\"slot\":" + std::to_string(g_lowlat.slot()) + "}";
         return;
       }
-      CreateDirectoryW(L"rec", nullptr);
-      SYSTEMTIME t;
-      GetLocalTime(&t);
-      char name[96];
-      std::snprintf(name, sizeof name, "rec/pilot%d-%04d%02d%02d-%02d%02d%02d", n, t.wYear, t.wMonth, t.wDay, t.wHour,
-                    t.wMinute, t.wSecond);
-      const double secs = std::clamp(jnum(body, "seconds", 1), 0.1, 10.0);
-      s->rx.radio->record(secs, name);
-      KP_LOGI("pilot %d: recording %.1f s of IQ to %s.cs16", n, secs, name);
-      out = "{\"file\":" + q(std::string(name) + ".cs16") + "}";
+      if (n >= 1 && n <= kMaxSlots && active(n)) {
+        KP_LOGI("low latency: pilot %d (%s)", n, lowlat_title(n).c_str());
+        g_lowlat.show(n, lowlat_title(n));
+      } else {
+        if (g_lowlat.slot()) KP_LOGI("low latency: off");
+        g_lowlat.show(0, "");
+      }
+      out = "{\"slot\":" + std::to_string(g_lowlat.slot()) + "}";
+      lowlat_tick();
+#else
+      status = "404 Not Found";
+      out = "{\"error\":\"Low latency mode is Windows only\"}";
+#endif
     };
   } else if (path == "/api/settings") {
     fn = [&, post] {
@@ -2528,11 +2629,6 @@ int main(int argc_in, char **argv_in) {
     (void)g_signals_blocked;
     KP_LOGI("%s %s running headless: open http://<this-device>:%d/ in a browser (Ctrl+C or systemctl stop to quit)",
             kProduct, kVersion, g_app.port);
-    // the buzzer (field-wifi.sh): 1 short = Play League is up and serving pages; 3 long = its web server failed
-    if (!kRx) {
-      const std::string b = g_app.feed_error.empty() ? " buzz 1" : " buzz 3 long";
-      std::thread([b] { run_out(std::string(kFieldWifi) + b); }).detach();
-    }
     int sig = 0;
     sigwait(&set, &sig);
     KP_LOGI("signal %d: shutting down", sig);
@@ -2600,6 +2696,9 @@ int main(int argc_in, char **argv_in) {
   e->stop();
 #endif
   if (g_app.usb_thread.joinable()) g_app.usb_thread.join();
+#ifdef _WIN32
+  g_lowlat.show(0, "");  // the low latency window
+#endif
   for (int i = 1; i <= kMaxSlots; i++)
     if (g_app.slots[i]) release(g_app.slots[i]->rx);
   release(g_app.scanner);

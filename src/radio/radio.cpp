@@ -1,4 +1,5 @@
 #include "radio.h"
+#include "mmcss.h"
 
 #include <algorithm>
 #include <chrono>
@@ -58,9 +59,22 @@ std::vector<double> scan_plan() {
 }
 }  // namespace
 
-Radio::Radio(FrameSink frames) : _frames(std::move(frames)) {}
+Radio::Radio(FrameSink frames, LineSink lines) : _frames(std::move(frames)), _lines(std::move(lines)) {}
 
 Radio::~Radio() { close(); }
+
+bool Radio::is_idle() {
+  std::lock_guard<std::mutex> l(_m);
+  return _mode == Mode::Idle;
+}
+
+void Radio::lowlat_thread() {
+  thread_local int was = 0;
+  const int on = _lowlat.load(std::memory_order_relaxed) ? 1 : 0;
+  if (on == was) return;
+  was = on;
+  arx::mmcss_thread(on);
+}
 
 bool Radio::is_open() const {
   std::lock_guard<std::mutex> l(_m);
@@ -144,6 +158,7 @@ void Radio::on_bank(const uint8_t *b, size_t n, uint64_t seq, uint32_t gen, doub
     boosted = true;
     boost_thread("usb stream");
   }
+  lowlat_thread();
   std::vector<uint8_t> v;
   {
     std::lock_guard<std::mutex> l(_qm);
@@ -155,12 +170,13 @@ void Radio::on_bank(const uint8_t *b, size_t n, uint64_t seq, uint32_t gen, doub
   v.assign(b, b + n);
   {
     std::lock_guard<std::mutex> l(_qm);
-    if (_q.size() >= _qcap) {
+    const double t_s = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    // full (100 ms); low latency: also banks over 8 ms old (a backlog: dropped, not shown late; a burst is kept)
+    while (!_q.empty() && (_q.size() >= _qcap || (_lowlat && t_s - _q.front().t_s > 0.008))) {
       _pool.push_back(std::move(_q.front().data));
       _q.pop_front();
       _dropped++;
     }
-    const double t_s = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     _q.push_back(Bank{std::move(v), seq, gen, fs, centre, shift, t_s});
   }
   _banks++;
@@ -230,14 +246,6 @@ void Radio::watch(double hz) {
   _mode_epoch++;
 }
 
-void Radio::stream_test(int rate_sel, double seconds) {
-  std::lock_guard<std::mutex> l(_m);
-  _mode = Mode::Test;
-  _mode_epoch++;
-  _req_rate = rate_sel;
-  _test_end_ms = static_cast<int64_t>(seconds * 1000);
-}
-
 void Radio::idle() {
   std::lock_guard<std::mutex> l(_m);
   _mode = Mode::Idle;
@@ -256,16 +264,6 @@ void Radio::set_gain(double db) {
 
 void Radio::set_combine(bool on) { _combine = on; }
 
-Radio::ComboStatus Radio::combine_status() {
-  std::lock_guard<std::mutex> l(_m);
-  return _comb_status;
-}
-
-void Radio::record(double seconds, const std::string &prefix) {
-  std::lock_guard<std::mutex> l(_m);
-  _rec_req_s = seconds;
-  _rec_req_prefix = prefix;
-}
 
 std::vector<Pilot> Radio::pilots() {
   std::lock_guard<std::mutex> l(_m);
@@ -372,25 +370,11 @@ void Radio::dsp_loop() {
           // one channel: beside it (off the DC point) like watch; several: the middle (between the carriers)
           tune(_time_hz.size() == 1 ? _time_hz[0] : _time_centre, _time_rate, _time_hz.size() == 1);
         }
-      } else if (mode == Mode::Test) {
-        int rate;
-        {
-          std::lock_guard<std::mutex> l(_m);
-          rate = _req_rate;
-          _test_result.clear();
-        }
-        _test_banks = _test_gaps = 0;
-        _test_last_seq = 0;
-        _test_t0_ms = 0;
-        _test_fs = wsdr::Receiver::rate_of(rate);
-        KP_LOGI("radio: stream test at %.1f MS/s", _test_fs / 1e6);
-        tune(5769e6, rate);
       }
     }
     switch (mode) {
     case Mode::Watch: handle_watch(b); break;
     case Mode::Scan: handle_scan(b); break;
-    case Mode::Test: handle_test(b); break;
     case Mode::Timing: handle_timing(b); break;
     case Mode::Idle: break;
     }
@@ -418,6 +402,7 @@ void Radio::dsp_loop() {
 }
 
 void Radio::handle_watch(Bank &b) {
+  lowlat_thread();  // the DSP thread
   double req;
   {
     std::lock_guard<std::mutex> l(_m);
@@ -426,7 +411,13 @@ void Radio::handle_watch(Bank &b) {
   // ignore banks from before the retune
   if (std::fabs(b.centre_hz + b.shift_hz - req) > 1e3) return;
   if (!_fe || b.fs != _fe_fs || b.shift_hz != _fe_shift) {
-    _fe = std::make_shared<FrontEnd>(b.fs, b.shift_hz, _frames);
+    DecoderOpts o;  // AnalogRX low latency: every line to _lines
+    if (_lines) o.lines = [this](const Line &l) {  // stamped with when its samples came in from USB
+      Line c = l;
+      c.t_s = _dec_t;
+      _lines(c);
+    };
+    _fe = std::make_shared<FrontEnd>(b.fs, b.shift_hz, _frames, o);
     _fe_fs = b.fs;
     _fe_shift = b.shift_hz;
   } else if (b.gen != _fe_gen) {
@@ -438,9 +429,8 @@ void Radio::handle_watch(Bank &b) {
   _fe_gen = b.gen;
   unpack(b, _iq);
   const bool comb = _combine.load();
-  unpack_b(b, _iqb);  // always: cheap, and a recording starts with both paths lined up
+  unpack_b(b, _iqb);  // always: cheap
   measure(b);
-  record_bank(b);  // both paths as they came in
   if (comb != _combine_was) {
     _comb.reset();
     _combine_was = comb;
@@ -468,12 +458,14 @@ void Radio::handle_watch(Bank &b) {
   _fe->demod(_iq.data(), _iq.size(), d, &bad);
   {
     std::lock_guard<std::mutex> l(_dqm);
-    if (_dq.size() >= 128) {  // ~26 ms behind: drop the oldest (the decoder re-phases)
+    // ~26 ms behind (low latency: over 8 ms since the oldest arrived): drop the oldest (the decoder re-phases)
+    const double tq = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    while (!_dq.empty() && (_dq.size() >= 128 || (_lowlat && tq - _dq.front().t_s > 0.008))) {
       _dpool.push_back(std::move(_dq.front().d));
       _dq.pop_front();
       _ddropped++;
     }
-    _dq.push_back(DBlock{_fe, std::move(d), std::move(bad)});
+    _dq.push_back(DBlock{_fe, std::move(d), std::move(bad), b.t_s});
   }
   _dqcv.notify_one();
 }
@@ -669,63 +661,6 @@ double Radio::gain_db() {
   return _gain_db;
 }
 
-// Debug recording: the watched IQ as int16 (LA value << 4, as wsdr_probe writes .cs16), whole banks.
-void Radio::record_bank(const Bank &b) {
-  if (!_rec) {
-    double secs;
-    std::string prefix;
-    {
-      std::lock_guard<std::mutex> l(_m);
-      secs = _rec_req_s;
-      prefix = _rec_req_prefix;
-      _rec_req_s = 0;
-    }
-    if (secs <= 0) return;
-    _rec = std::fopen((prefix + ".cs16").c_str(), "wb");
-    if (!_rec) {
-      KP_LOGE("record: cannot open %s.cs16", prefix.c_str());
-      return;
-    }
-    std::setvbuf(_rec, nullptr, _IOFBF, 1 << 20);
-    _rec_b = std::fopen((prefix + "_b.cs16").c_str(), "wb");
-    if (_rec_b) std::setvbuf(_rec_b, nullptr, _IOFBF, 1 << 20);
-    _rec_prefix = prefix;
-    _rec_left = static_cast<uint64_t>(secs * b.fs);
-    _rec_samples = 0;
-    _rec_fs = b.fs;
-    _rec_centre = b.centre_hz;
-    _rec_shift = b.shift_hz;
-    KP_LOGI("record: %.1f s at %.0f MS/s -> %s.cs16", secs, b.fs / 1e6, prefix.c_str());
-  }
-  const size_t ns = std::min<uint64_t>(_iq.size(), _rec_left);
-  std::vector<int16_t> buf(2 * ns);
-  for (size_t i = 0; i < ns; i++) {
-    buf[2 * i] = static_cast<int16_t>(static_cast<int>(_iq[i].real()) * 16);
-    buf[2 * i + 1] = static_cast<int16_t>(static_cast<int>(_iq[i].imag()) * 16);
-  }
-  std::fwrite(buf.data(), 4, ns, _rec);
-  if (_rec_b && _iqb.size() >= ns) {
-    for (size_t i = 0; i < ns; i++) {
-      buf[2 * i] = static_cast<int16_t>(static_cast<int>(_iqb[i].real()) * 16);
-      buf[2 * i + 1] = static_cast<int16_t>(static_cast<int>(_iqb[i].imag()) * 16);
-    }
-    std::fwrite(buf.data(), 4, ns, _rec_b);
-  }
-  _rec_left -= ns;
-  _rec_samples += ns;
-  if (_rec_left == 0) {
-    std::fclose(_rec);
-    _rec = nullptr;
-    if (_rec_b) std::fclose(_rec_b), _rec_b = nullptr;
-    if (FILE *j = std::fopen((_rec_prefix + ".json").c_str(), "w")) {
-      std::fprintf(j, "{\"format\":\"cs16\",\"sample_rate\":%.0f,\"centre_hz\":%.0f,\"shift_hz\":%.0f,\"samples\":%llu,"
-                   "\"source\":\"kepyur watch\",\"path_b\":\"%s_b.cs16\"}\n", _rec_fs, _rec_centre, _rec_shift, (unsigned long long)_rec_samples,
-                   _rec_prefix.substr(_rec_prefix.find_last_of("/\\") + 1).c_str());
-      std::fclose(j);
-    }
-    KP_LOGI("record: done, %llu samples -> %s.cs16", (unsigned long long)_rec_samples, _rec_prefix.c_str());
-  }
-}
 
 void Radio::decode_loop() {
   boost_thread("decode");
@@ -741,12 +676,15 @@ void Radio::decode_loop() {
       blk = std::move(_dq.front());
       _dq.pop_front();
     }
+    lowlat_thread();
     const auto ta = std::chrono::steady_clock::now();
     if (blk.fe != cur) {
       cur = blk.fe;
       _frames_at_last = 0;
       _fps_t0_ms = now_ms();
     }
+    cur->set_async_frames(_lowlat.load(std::memory_order_relaxed));
+    _dec_t = blk.t_s;
     cur->decode(blk.d.data(), blk.d.size(), blk.bad.size() == blk.d.size() ? blk.bad.data() : nullptr);
     busy += std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
     {
@@ -876,41 +814,6 @@ void Radio::scan_step_done() {
   _cap.clear();
 }
 
-void Radio::handle_test(Bank &b) {
-  if (std::fabs(b.fs - _test_fs) > 1) return;
-  const int64_t t = now_ms();
-  if (_test_t0_ms == 0) {
-    _test_t0_ms = t;
-    _test_last_seq = b.seq;
-    _test_gen = b.gen;
-    _test_runs = 1;
-    KP_LOGI("test: first bank at %.1f MS/s (gen %u)", b.fs / 1e6, b.gen);
-  } else if (b.gen != _test_gen) {
-    _test_gen = b.gen;  // a stream restart (seq starts over): counted as a run, not as a gap
-    _test_runs++;
-    KP_LOGW("test: stream restarted (gen %u): %s", b.gen, _rx->status().last_fault.c_str());
-  } else if (b.seq != _test_last_seq + 1) {
-    _test_gaps++;
-  }
-  _test_last_seq = b.seq;
-  _test_banks++;
-  const double el = (t - _test_t0_ms) / 1000.0;
-  const double expect = el * b.fs / wsdr::Stream8822b::kBankSamples;
-  std::ostringstream o;
-  o << "{\"rate_msps\":" << b.fs / 1e6 << ",\"seconds\":" << el << ",\"banks\":" << _test_banks
-    << ",\"expected\":" << static_cast<uint64_t>(expect) << ",\"seq_gaps\":" << _test_gaps
-    << ",\"stream_runs\":" << _test_runs
-    << ",\"restarts\":" << _rx->status().restarts << ",\"queue_dropped\":" << _dropped.load()
-    << ",\"done\":" << (el * 1000 >= _test_end_ms ? "true" : "false") << "}";
-  std::lock_guard<std::mutex> l(_m);
-  _test_result = o.str();
-  if (el * 1000 >= _test_end_ms) {
-    KP_LOGI("test: result %s", _test_result.c_str());
-    _mode = Mode::Idle;
-    _mode_epoch++;
-  }
-}
-
 static std::string jstr(const std::string &s) {
   std::string o = "\"";
   for (char c : s) {
@@ -946,7 +849,6 @@ std::string Radio::status_json() {
       << ",\"snr_b\":" << d.snr_b_db << ",\"snr_c\":" << d.snr_c_db << ",\"b_share\":" << d.b_share
       << ",\"a_fade\":" << d.a_fade << ",\"rescued\":" << d.rescued << ",\"coherence\":" << d.coherence << "}";
   }
-  o << ",\"test\":" << (_test_result.empty() ? "null" : _test_result);
   o << ",\"pilots\":[";
   const int64_t t = now_ms();
   for (size_t i = 0; i < _pilots.size(); i++) {

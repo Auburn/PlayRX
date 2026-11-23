@@ -1,4 +1,4 @@
-// Starting helper programs on Linux (ffmpeg for the DVR, espeak-ng / aplay for the voice): posix_spawnp with the
+// Starting helper programs on Linux (espeak-ng / aplay for the voice, ffmpeg): posix_spawnp with the
 // signal mask cleared (the app blocks SIGINT / SIGTERM for its own shutdown; children must not inherit that),
 // optionally its own process group (so a pipeline can be stopped as a whole) and a pipe on its stdin.
 #pragma once

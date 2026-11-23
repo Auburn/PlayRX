@@ -47,11 +47,8 @@ public:
 
   // A decoded picture for a slot (B, G, R, x per pixel), from any thread. Copies it.
   void push(int slot, const uint8_t *bgrx, int w, int h);
-  // Read a slot's latest picture under its lock; `age_ms` < 0 when there is none.
-  void with_frame(int slot, const std::function<void(const uint8_t *bgrx, int w, int h, int64_t age_ms)> &f);
   void set_info(int slot, const SlotInfo &info);
   void clear(int slot);  // the pilot left: no picture, no info
-  int clients() const { return _clients; }
 
   // Live events for the UI and overlays: /ws/events, one text message (JSON) per event, from any thread.
   // A client that connects gets the events from then on; the last few are kept for slow readers.
@@ -62,9 +59,6 @@ public:
   using Handler = std::function<bool(const std::string &method, const std::string &path, const std::string &body,
                                      std::string &status, std::string &type, std::string &out)>;
   void set_handler(Handler h) { _handler = std::move(h); }  // before start()
-  // /dvr/<path>: files under this folder (the DVR's recordings), with byte ranges so a video player can seek.
-  // The function is asked on every request (the folder can change). Before start().
-  void set_files_root(std::function<std::filesystem::path()> root) { _files_root = std::move(root); }
   // Feed node (src/capture/net_feed.h): GET /node/stream/N streams slot N's pictures, gate levels and status to a
   // race PC. levels(slot, cursor, out) appends the levels newer than cursor (cursor < 0: from now on) as
   // 16-byte points (double t, float a, float b) and moves the cursor; status(slot) is a JSON text. Unset: 404.
@@ -82,8 +76,6 @@ private:
   std::atomic<int> _node_streams[kMaxSlots + 1] = {};
   void serve_node(uintptr_t sock, int slot);
   Handler _handler;
-  std::function<std::filesystem::path()> _files_root;
-  void serve_file_range(uintptr_t sock, const std::string &path, const std::string &range);
   struct Slot {
     std::mutex m;
     std::condition_variable cv;
@@ -129,7 +121,6 @@ private:
   std::mutex _cm;
   std::vector<std::thread> _threads;
   std::vector<uintptr_t> _socks;
-  std::atomic<int> _clients{0};
 };
 
 // JPEG-encode B, G, R, x pixels with Windows' own codec (WIC). quality 0..1.

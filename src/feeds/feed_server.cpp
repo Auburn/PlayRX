@@ -255,13 +255,6 @@ void FeedServer::push(int slot, const uint8_t *bgrx, int w, int h) {
   notify_any();
 }
 
-void FeedServer::with_frame(int slot, const std::function<void(const uint8_t *, int, int, int64_t)> &f) {
-  if (slot < 1 || slot > kMaxSlots) return;
-  Slot &s = _slots[slot];
-  std::lock_guard<std::mutex> l(s.m);
-  f(s.bgrx.empty() ? nullptr : s.bgrx.data(), s.w, s.h, s.bgrx.empty() ? -1 : now_ms() - s.t_ms);
-}
-
 void FeedServer::set_info(int slot, const SlotInfo &info) {
   if (slot < 1 || slot > kMaxSlots) return;
   std::lock_guard<std::mutex> l(_slots[slot].m);
@@ -337,7 +330,6 @@ void FeedServer::accept_loop() {
 
 void FeedServer::serve(uintptr_t sock) {
   SOCKET s = static_cast<SOCKET>(sock);
-  _clients++;
   std::string req;
   char buf[2048];
   while (req.find("\r\n\r\n") == std::string::npos && req.size() < 16384) {
@@ -398,16 +390,6 @@ void FeedServer::serve(uintptr_t sock) {
     if (want.empty())
       for (int i = 1; i <= kMaxSlots; i++) want.push_back(i);
     serve_ws(sock, ws_key, want);
-  } else if (method == "GET" && path.compare(0, 5, "/dvr/") == 0 && _files_root) {
-    std::string range;
-    if (hdr_end != std::string::npos) {
-      std::string lower = req.substr(0, hdr_end);
-      for (char &c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      const size_t k = lower.find("\r\nrange:");
-      if (k != std::string::npos) range = lower.substr(k + 8, lower.find("\r\n", k + 8) - (k + 8));
-      range.erase(0, range.find_first_not_of(" \t"));
-    }
-    serve_file_range(sock, path.substr(5), range);
   } else if (method == "GET" && _node_levels && (n = slot_from(path, "/node/stream/"))) {
     serve_node(sock, n);
   } else if (_handler && _handler(method, path, body, h_status, h_type, h_out)) {
@@ -431,7 +413,6 @@ void FeedServer::serve(uintptr_t sock) {
     send_response(s, "404 Not Found", "text/plain", "not found\n");
   }
   closesocket(s);
-  _clients--;
   std::lock_guard<std::mutex> l(_cm);
   for (size_t i = 0; i < _socks.size(); i++)
     if (_socks[i] == sock) {
@@ -447,86 +428,6 @@ void FeedServer::serve(uintptr_t sock) {
     }
 }
 
-// A recording, whole or a byte range of it ("bytes=a-b", "bytes=a-"): what a <video> asks for when it seeks.
-// The path is URL-decoded and must stay inside the folder. A file still being written is served as far as it goes.
-void FeedServer::serve_file_range(uintptr_t sock, const std::string &enc, const std::string &range) {
-  SOCKET s = static_cast<SOCKET>(sock);
-  std::string rel;
-  for (size_t i = 0; i < enc.size() && enc[i] != '?' && enc[i] != '#'; i++) {
-    if (enc[i] == '%' && i + 2 < enc.size()) {
-      rel += static_cast<char>(std::strtol(enc.substr(i + 1, 2).c_str(), nullptr, 16));
-      i += 2;
-    } else {
-      rel += enc[i] == '+' ? ' ' : enc[i];
-    }
-  }
-  if (rel.empty() || rel.find("..") != std::string::npos || rel.find(':') != std::string::npos || rel[0] == '/' || rel[0] == '\\') {
-    send_response(s, "404 Not Found", "text/plain", "not found\n");
-    return;
-  }
-  const std::filesystem::path full = (_files_root() / std::filesystem::path(std::u8string(rel.begin(), rel.end()))).make_preferred();
-#ifdef _WIN32
-  // shared for delete too: a recording being played (Replay, OBS) can still be deleted from the Replay page;
-  // Windows removes it once this read finishes
-  FILE *f = nullptr;
-  const HANDLE fh = CreateFileW(full.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                                FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (fh != INVALID_HANDLE_VALUE) {
-    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(fh), _O_RDONLY | _O_BINARY);
-    if (fd < 0) CloseHandle(fh);
-    else if (!(f = _fdopen(fd, "rb"))) _close(fd);
-  }
-#else
-  FILE *f = std::fopen(full.c_str(), "rb");
-#endif
-  if (!f) {
-    send_response(s, "404 Not Found", "text/plain", "not found\n");
-    return;
-  }
-#ifndef _WIN32
-#define _fseeki64 fseeko
-#define _ftelli64 ftello
-#endif
-  _fseeki64(f, 0, SEEK_END);
-  const int64_t size = _ftelli64(f);
-  int64_t a = 0, b = size - 1;
-  bool partial = false;
-  if (range.compare(0, 6, "bytes=") == 0) {
-    const char *p = range.c_str() + 6;
-    char *e = nullptr;
-    if (*p == '-') {  // the last N bytes
-      a = std::max<int64_t>(0, size - std::strtoll(p + 1, nullptr, 10));
-    } else {
-      a = std::strtoll(p, &e, 10);
-      if (e && *e == '-' && std::isdigit(static_cast<unsigned char>(e[1]))) b = std::min<int64_t>(size - 1, std::strtoll(e + 1, nullptr, 10));
-    }
-    partial = true;
-  }
-  if (size == 0 || a > b || a >= size) {
-    std::fclose(f);
-    send_str(s, "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */" + std::to_string(size) +
-                    "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    return;
-  }
-  const bool mp4 = rel.size() > 4 && rel.compare(rel.size() - 4, 4, ".mp4") == 0;
-  std::string head = std::string("HTTP/1.1 ") + (partial ? "206 Partial Content" : "200 OK") + "\r\nContent-Type: " +
-                     (mp4 ? "video/mp4" : "application/octet-stream") + "\r\nContent-Length: " + std::to_string(b - a + 1) +
-                     "\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n";
-  if (partial) head += "Content-Range: bytes " + std::to_string(a) + "-" + std::to_string(b) + "/" + std::to_string(size) + "\r\n";
-  head += "\r\n";
-  if (send_str(s, head)) {
-    _fseeki64(f, a, SEEK_SET);
-    std::vector<char> buf(256 * 1024);
-    int64_t left = b - a + 1;
-    while (left > 0) {
-      const size_t want = static_cast<size_t>(std::min<int64_t>(left, static_cast<int64_t>(buf.size())));
-      const size_t got = std::fread(buf.data(), 1, want, f);
-      if (got == 0 || !send_all(s, buf.data(), got)) break;
-      left -= static_cast<int64_t>(got);
-    }
-  }
-  std::fclose(f);
-}
 
 void FeedServer::serve_mjpeg(uintptr_t sock, int slot) {
   SOCKET s = static_cast<SOCKET>(sock);

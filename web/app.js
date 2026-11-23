@@ -155,7 +155,7 @@ function route() {
   const nodeMode = !!S.settings?.node_mode;
   document.body.classList.toggle('node-mode', nodeMode);
   const name = name0 || (nodeMode ? 'node' : S.state?.edition === 'rx' ? 'live' : 'dash');  // Play League opens on the Dashboard; a feed node on its page
-  const rxOff = S.state?.edition === 'rx' && ['dash', 'timing', 'start', 'race', 'events', 'roster', 'leagues', 'quick', 'replay'].includes(name);  // racing views: Play League only
+  const rxOff = false;  // the racing views are not in Play RX
   const nodeOff = nodeMode && !['node', 'live', 'pilots', 'adapters', 'settings', 'log', 'timing'].includes(name);  // a feed node: no racing pages (Timing: view only)
   const view = nodeOff ? 'node' : views[name] && !rxOff ? name : 'live';
   $$('#nav .nav-item').forEach(a => a.classList.toggle('active', a.dataset.view === view));
@@ -174,9 +174,45 @@ views.live = (el, arg) => {
   el.innerHTML = `
     <div class="view-head"><h1>Live</h1><span class="sub" id="live-sub"></span><div class="spacer"></div>
       <span class="faint">Click a feed to show it alone · F11 full screen</span>
+      <button class="btn hidden" id="live-ll" title="Low latency: the feed you clicked (or the first) in its own window, each line drawn the moment it arrives instead of a whole picture at a time. F11 or double-click in that window for full screen: the lowest latency."><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" style="vertical-align:-3px;margin-right:4px"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg><span>Low latency</span></button>
+      <span class="faint hidden" id="live-llstat" title="In the app: from a line arriving over USB to the moment it is handed to the display (average · worst in the last second). Add the display's own scan-out: about half a refresh (8 ms at 60 Hz, 2 ms at 240 Hz)."></span>
+      <label class="row tight hidden" id="live-llsolo" title="While low latency is on, the other feeds stop decoding (their timing and pictures too), so the low latency feed has the PC to itself. They come back when low latency ends."><input type="checkbox" class="switch"><span class="faint">Pause other feeds</span></label>
       <select class="select" id="live-add" title="Watch a channel: adds a feed on it, no setup needed"></select></div>
     <div class="tiles" id="tiles"></div>`;
   // the quick way in: pick a channel, get a feed on it (named "Pilot n"; rename it on the Slots / Feeds page later)
+  // low latency: one feed in its own Direct3D window (Windows), drawn line by line
+  const llBtn = $('#live-ll', el);
+  llBtn.onclick = async () => {
+    const cur = S.state?.lowlat?.slot || 0, first = usedSlots()[0]?.slot || 0;
+    const want = cur ? 0 : (focus || first);
+    if (!cur && !want) return toast('Watch a channel first');
+    try {
+      const r = await post('/api/lowlat', {slot: want});
+      if (want && !r.slot) toast('Could not open the low latency window');
+      else if (want) toast('Low latency window open · F11 there for full screen');
+      await pollState();
+    } catch { toast('Could not change low latency'); }
+  };
+  function llUpdate() {
+    const ll = S.state?.lowlat || {}, on = ll.slot || 0;
+    llBtn.classList.toggle('hidden', !ll.supported);
+    llBtn.classList.toggle('btn-primary', !!on);
+    const s = on && usedSlots().find(x => x.slot === on);
+    const txt = on ? `Low latency: ${s?.name || 'Feed ' + on} · stop` : 'Low latency';
+    const span = llBtn.querySelector('span');
+    if (span.textContent !== txt) span.textContent = txt;
+    if (ll.error && !on) llBtn.title = 'Low latency: ' + ll.error;
+    const stat = $('#live-llstat', el), solo = $('#live-llsolo', el), box = solo.querySelector('input');
+    stat.classList.toggle('hidden', !on);
+    const st = on ? (ll.age_ms ? `${ll.age_ms.toFixed(1)} ms in app · worst ${ll.age_max_ms.toFixed(1)}` : 'waiting for a picture') + (ll.fullscreen ? ' · full screen' : ' · windowed (F11 there)') : '';
+    if (stat.textContent !== st) stat.textContent = st;
+    solo.classList.toggle('hidden', !ll.supported);
+    if (document.activeElement !== box) box.checked = !!ll.solo;
+  }
+  $('#live-llsolo input', el).onchange = async e => {
+    try { await post('/api/lowlat', {solo: e.target.checked}); await pollState(); }
+    catch { toast('Could not change it'); }
+  };
   const addSel = $('#live-add', el);
   let addSig = '';
   function fillAdd() {
@@ -238,6 +274,7 @@ views.live = (el, arg) => {
   function update() {
     const slots = usedSlots();
     fillAdd();
+    llUpdate();
     $('#live-sub', el).textContent = slots.length ? `${slots.length} ${isRx() ? 'feed' : 'pilot'}${slots.length > 1 ? 's' : ''}` : '';
     const want = new Set(slots.map(s => s.slot));
     for (const [n, t] of tiles) if (!want.has(n)) { t.remove(); tiles.delete(n); }
@@ -277,13 +314,14 @@ views.live = (el, arg) => {
       t.hidden = focus && focus !== s.slot && want.has(focus);
       t.querySelector('.tile-name').textContent = s.name;
       t.querySelector('.tile-ch').textContent = `${s.channel} ${Math.round(s.mhz)}`;
-      const msg = {no_signal: 'NO SIGNAL', opening: 'OPENING ADAPTER', no_adapter: 'NO ADAPTER', error: 'ADAPTER ERROR', timing: 'TIMING ONLY', rotorhazard: 'ROTORHAZARD TIMING', usb_wait: 'NO USB PICTURE', usb_error: 'USB VIDEO ERROR'}[s.state] || '';
+      const msg = {paused: 'PAUSED · LOW LATENCY', no_signal: 'NO SIGNAL', opening: 'OPENING ADAPTER', no_adapter: 'NO ADAPTER', error: 'ADAPTER ERROR', timing: 'TIMING ONLY', rotorhazard: 'ROTORHAZARD TIMING', usb_wait: 'NO USB PICTURE', usb_error: 'USB VIDEO ERROR'}[s.state] || '';
       // not locked, but pictures still arriving (a weak or breaking-up signal): don't cover them with "NO SIGNAL"
       const pics = performance.now() - Number(t.querySelector('canvas').dataset.at || -1e9) < 1500;
       const weak = s.state === 'no_signal' && pics;
       t.querySelector('.tile-msg').textContent = weak ? '' : msg;
       const r = raceOf(s.slot);
-      const foot = s.state === 'locked' ? `<span class="pill pill-good">${s.fps} fps</span>` : weak ? '<span class="pill pill-warn" title="The receiver is not locked onto this picture: move closer, or check the channel">Weak signal</span>' : '';
+      const llPill = S.state?.lowlat?.slot === s.slot ? ' <span class="pill pill-accent plain" title="Also in the low latency window">LOW LATENCY</span>' : '';
+      const foot = s.state === 'locked' ? `<span class="pill pill-good">${s.fps} fps</span>${llPill}` : weak ? '<span class="pill pill-warn" title="The receiver is not locked onto this picture: move closer, or check the channel">Weak signal</span>' : '';
       const fe = t.querySelector('.tile-foot');
       if (fe.innerHTML !== foot) fe.innerHTML = foot;
     }
@@ -425,9 +463,11 @@ views.pilots = el => {
     }
     else if (k === 'pid') {
       const id = Number(e.target.value);
-      await post(`/api/pilots/${n}`, {pilot_id: id});
-      const p = list.find(x => x.id === id);
-      if (p) toast(`${p.name} on slot ${n}${p.channel && p.channel !== S.state.slots[n - 1].channel ? ` (their usual channel is ${p.channel})` : ''}`);
+      const p = list.find(x => x.id === id), cur = S.state.slots[n - 1].channel;
+      // their usual channel too, unless a heat is loaded (the heat planned the channels)
+      const usual = p?.channel && p.channel !== cur && !S.state?.heat ? S.channels.find(c => c.name === p.channel) : null;
+      await post(`/api/pilots/${n}`, usual ? {pilot_id: id, mhz: usual.mhz, channel: usual.name} : {pilot_id: id});
+      if (p) toast(`${p.name} on slot ${n}${usual ? ` on their usual channel ${usual.name}` : p.channel && p.channel !== cur ? ` (their usual channel is ${p.channel})` : ''}`);
     }
     else await post(`/api/pilots/${n}`, k === 'mhz' ? chosen(e.target) : {name: e.target.value.trim()});
     sig = '';
@@ -727,6 +767,10 @@ views.settings = (el, arg) => {
     c.addEventListener('change', async () => {
       const v = c.type === 'checkbox' ? c.checked : c.dataset.t === 'str' ? c.value : c.dataset.t === 'bool' ? c.value === 'true' : Number(c.value);
       S.settings = await post('/api/settings', {[k]: v});
+      if (c.tagName === 'INPUT' && c.dataset.t === 'str' && v.trim() && String(S.settings[k] ?? '') !== v) {
+        c.value = S.settings[k] ?? '';
+        toast(k === 'obs_url' ? 'The OBS address starts with ws:// (e.g. ws://localhost:4455): kept the previous one' : 'Not accepted: kept the previous value');
+      }
       for (const o of $$('[data-s="' + k + '"]', el)) if (o !== c && o.type === 'checkbox') o.checked = !!S.settings[k];  // the same switch shown twice
     });
   }

@@ -60,6 +60,19 @@ export function liveClock(key, el, elapsed_s, running, fmt = clock) {
 }
 
 
+// OBS pages (body.broadcast) reload themselves when Play League's pages change (an update): an OBS Browser Source
+// keeps running the copy it loaded until it is refreshed by hand, so it would go on showing the old version
+if (typeof document !== 'undefined' && document.body?.classList.contains('broadcast')) {
+  let seen = null;
+  setInterval(async () => {
+    try {
+      const v = (await fetch('/api/uiver', {cache: 'no-store'}).then(r => r.json())).v;
+      if (seen === null) seen = v;
+      else if (v && v !== seen) location.reload();
+    } catch { /* the app restarting: try again */ }
+  }, 5000);
+}
+
 // Live events from the engine (/ws/events): fn({type, ...}) for each; reconnects on its own. Types: hello, flow,
 // pass, result, heat, league. Returns {close()}.
 export function events(fn) {

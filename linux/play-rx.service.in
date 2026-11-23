@@ -1,0 +1,20 @@
+# Play RX, headless (installed by linux/install.sh; @USER@ is the user who installed it)
+[Unit]
+Description=Play RX (analog FPV video from RTL8812BU adapters)
+After=network.target
+
+[Service]
+User=@USER@
+SupplementaryGroups=plugdev
+ExecStart=/opt/play-rx/play-rx
+WorkingDirectory=/opt/play-rx
+# the radio threads raise their priority so USB never misses the adapter's tiny buffer
+AmbientCapabilities=CAP_SYS_NICE
+Restart=on-failure
+RestartSec=3
+# SIGTERM: radios closed in order, then exit
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

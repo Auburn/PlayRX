@@ -2,7 +2,7 @@
 // RTMP stream, pushed to rtmp://<host>:<port + slot - 1>/live/pilot<slot>. FPV Trackside's "RTMP Server" video
 // sources listen on 19301, 19302, ... in the order they are added, so with the defaults pilot 1 goes to the first
 // such source, pilot 2 to the second.
-// Like the DVR, live video never waits on it: frame() only copies the newest picture; each slot's own thread scales
+// Live video never waits on it: frame() only copies the newest picture; each slot's own thread scales
 // it into the 854 x 480 frame, encodes and sends. Trackside scales that frame into its 4:3 pilot views, so by default
 // the 4:3 picture fills the whole frame (Trackside's squeeze brings it back to 4:3); `bars` keeps it 4:3 inside the
 // frame with black bars either side instead (for a 16:9 view).

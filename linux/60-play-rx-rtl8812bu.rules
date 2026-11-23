@@ -1,0 +1,4 @@
+# Play RX: RTL8812BU adapters as receivers, usable without root
+# (Realtek's own id 0bda:b812, e.g. Cudy AC1300; TP-Link Archer T4U v3 2357:0115)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="b812", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2357", ATTR{idProduct}=="0115", MODE="0666"

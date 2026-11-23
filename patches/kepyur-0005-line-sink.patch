@@ -1,0 +1,457 @@
+--- a/native/dsp/video.h
++++ b/native/dsp/video.h
+@@ -1,122 +1,138 @@
+-// kepyur: analog FPV video decoder (FM composite -> 8-bit grey frames). Shared by the app and the desktop
+-// tools. Grown from vtx-spike/viewer/vtxview.cpp.
+-//
+-//   FrontEnd fe(fs_in, shift_hz, on_frame);   // fs_in 40e6 (halfband to 20 MS/s) or 20e6
+-//   for (each IQ sample) fe.feed(x);
+-//
+-// Single-threaded: feed() and every callback run on the caller's thread.
+-#pragma once
+-#include <complex>
+-#include <cstdint>
+-#include <functional>
+-#include <vector>
+-
+-namespace kp {
+-
+-using cf = std::complex<float>;
+-
+-struct VideoStd {
+-  double T_us;   // line period
+-  double a0_us;  // active video start after the hsync leading edge
+-  double aw_us;  // active video width
+-  int active;    // active lines per field
+-  int skip;      // lines from the field's first broad pulse to the first active line
+-  const char *name;
+-};
+-extern const VideoStd kNtsc, kPal;
+-
+-// A finished picture, 4 bytes per pixel (R, G, B, 0xff). Valid only during the callback.
+-struct Frame {
+-  const uint8_t *data;
+-  int width, height;  // 720 x 480 (NTSC) / 720 x 576 (PAL)
+-  const VideoStd *std;
+-};
+-using FrameSink = std::function<void(const Frame &)>;
+-
+-struct DecoderStats {
+-  bool acquiring = true;
+-  float sign = 1, tip = 0, blank = 0;     // levels in MHz of discriminator output
+-  uint64_t lines = 0, lines_locked = 0;   // since the last acquisition
+-  uint64_t fields = 0, frames = 0;        // since construction
+-  uint64_t acquisitions = 0, losses = 0;  // successful acquisitions, lock losses
+-  uint64_t rephases = 0;                  // line grid moved onto a jumped signal without re-acquiring
+-  // AnalogRX sparkle repair (set_repair): FM clicks patched over, and badly hit lines kept from the last field
+-  uint64_t clicks_repaired = 0, lines_kept = 0;
+-  double line_us = 0;                     // tracked line period
+-  float lock_recent = 0;                  // locked fraction over the last ~2 fields
+-  bool colour = false;                    // colour is being decoded (burst present and steady)
+-  float burst_err = 0;                    // mean burst phase error (rad)
+-  const char *std_name = "?";
+-};
+-
+-struct DecoderOpts {
+-  int width = 720;
+-  bool fields = true;          // true: every field, line-doubled (60/50 Hz, no combing); false: woven frames
+-  int std_force = 0;           // 0 auto, 1 NTSC, 2 PAL
+-  bool force_invert = false;   // only try sync at the high-frequency end
+-  bool colour = true;          // decode colour (falls back to grey when there is no usable burst)
+-  // AnalogRX: how colour is kept out of the picture's brightness (NTSC; PAL always uses the notch).
+-  //  0 = classic: 3 MHz 4th-order low-pass + a notch at the subcarrier (rings ~4 px after every edge)
+-  //  1 = comb: a gentle 4.8 MHz low-pass, colour cancelled with the line before (no ringing, sharper)
+-  // -1 = from the environment, ARX_LUMA=classic|comb (default comb)
+-  int luma_filter = -1;
+-};
+-
+-class Decoder;
+-
+-// AnalogRX: sparkle repair, for every decoder in the process (takes effect at once). The white / black
+-// sparkles of a weak signal are FM "clicks": the carrier's envelope collapses and its phase slips a turn. The
+-// front end marks those instants; the decoder, which draws each line about a line after it arrives, patches the
+-// picture over each mark (a straight line between the good points either side; sync is left alone) and redraws
+-// a badly hit line from the lines above and below it. Nothing is held back: no delay is added.
+-void set_repair(bool on);
+-bool repair_on();
+-
+-// AnalogRX: adaptive comb (NTSC comb mode), for every decoder in the process. The comb separates colour from
+-// brightness by comparing each line with the one before; where that line is clearly different (OSD text,
+-// horizons) it leaves a halo and false colour. There the brightness falls back to the notch filter and the
+-// colour is faded out. Uses only the line before: no delay is added.
+-void set_adaptive_comb(bool on);
+-bool adaptive_comb_on();
+-
+-// AnalogRX: smooth lines (DecoderOpts::fields), for every decoder in the process. A field is every other line of
+-// the picture; it used to be shown with each line twice (stair-stepped edges, and the two fields half a line
+-// apart, so the picture shimmered up and down). On: each field's lines go in their own place and the lines
+-// between are interpolated along edges (edge-based line averaging). Done as each field ends: no delay.
+-void set_smooth_lines(bool on);
+-bool smooth_lines_on();
+-
+-// IQ (at fs_in) -> DC removal -> NCO -> [halfband /2 when fs_in >= 40e6] -> FM discriminator -> Decoder.
+-class FrontEnd {
+-public:
+-  FrontEnd(double fs_in, double shift_hz, FrameSink sink, const DecoderOpts &o = {});
+-  ~FrontEnd();
+-  void set_shift(double shift_hz);  // carrier offset from the stream centre (Hz) to bring to 0
+-  double shift() const { return _shift; }
+-  void feed(const cf *x, size_t n);  // demod + decode
+-  // The two halves, for running them on two threads: demod() -> discriminator output (MHz at fs_demod),
+-  // decode() -> frames. Each half is single-threaded.
+-  // bad (optional, sparkle repair): per output sample, 1 = the carrier's envelope collapsed there (a click)
+-  void demod(const cf *x, size_t n, std::vector<float> &out, std::vector<uint8_t> *bad = nullptr);
+-  void decode(const float *d, size_t n, const uint8_t *bad = nullptr);
+-  DecoderStats stats() const;
+-  double fs_demod() const { return _fs_out; }
+-
+-private:
+-  double _fs_in, _fs_out, _shift = 0;
+-  bool _decimate;
+-  static constexpr int kHb = 23;   // halfband taps
+-  static constexpr int kTab = 4096;  // mixer table / chunk length
+-  float _h[kHb];
+-  std::vector<float> _tr, _ti;     // step^i, i < kTab
+-  cf _stepN{1, 0}, _rot{1, 0}, _dc{}, _prev{1, 0};
+-  std::vector<float> _wr, _wi;     // mixed samples with kHb-1 of history in front
+-  std::vector<float> _yr, _yi;     // decimated
+-  int _phase = 0;                  // start of the next halfband window in the next chunk (0 or 1)
+-  std::vector<float> _dbuf;
+-  Decoder *_dec;
+-  std::vector<float> _env;  // sparkle repair: each output sample's envelope (power)
+-  float _pref = 0;          // ... and its recent level
+-};
+-
+-}  // namespace kp
++// kepyur: analog FPV video decoder (FM composite -> 8-bit grey frames). Shared by the app and the desktop
++// tools. Grown from vtx-spike/viewer/vtxview.cpp.
++//
++//   FrontEnd fe(fs_in, shift_hz, on_frame);   // fs_in 40e6 (halfband to 20 MS/s) or 20e6
++//   for (each IQ sample) fe.feed(x);
++//
++// Single-threaded: feed() and every callback run on the caller's thread.
++#pragma once
++#include <complex>
++#include <cstdint>
++#include <functional>
++#include <vector>
++
++namespace kp {
++
++using cf = std::complex<float>;
++
++struct VideoStd {
++  double T_us;   // line period
++  double a0_us;  // active video start after the hsync leading edge
++  double aw_us;  // active video width
++  int active;    // active lines per field
++  int skip;      // lines from the field's first broad pulse to the first active line
++  const char *name;
++};
++extern const VideoStd kNtsc, kPal;
++
++// A finished picture, 4 bytes per pixel (R, G, B, 0xff). Valid only during the callback.
++struct Frame {
++  const uint8_t *data;
++  int width, height;  // 720 x 480 (NTSC) / 720 x 576 (PAL)
++  const VideoStd *std;
++};
++using FrameSink = std::function<void(const Frame &)>;
++
++// AnalogRX low latency: one picture line, handed out the moment the decoder has drawn it (about a line after it
++// arrived) instead of at the end of its field. 4 bytes per pixel (R, G, B, 0xff); valid only during the callback.
++// row: the line within its field (0 .. active-1); field 0 is the lower field (frame lines 2*row + 1), field 1 the
++// upper (2*row). A line patched again later (sparkle repair) is handed out again.
++struct Line {
++  const uint8_t *data;
++  int width, row, field, active;
++  const VideoStd *std;
++  double t_s = 0;  // when the newest samples of the line arrived (steady clock, s): set by the caller of decode(), 0 = unknown
++};
++using LineSink = std::function<void(const Line &)>;
++
++struct DecoderStats {
++  bool acquiring = true;
++  float sign = 1, tip = 0, blank = 0;     // levels in MHz of discriminator output
++  uint64_t lines = 0, lines_locked = 0;   // since the last acquisition
++  uint64_t fields = 0, frames = 0;        // since construction
++  uint64_t acquisitions = 0, losses = 0;  // successful acquisitions, lock losses
++  uint64_t rephases = 0;                  // line grid moved onto a jumped signal without re-acquiring
++  // AnalogRX sparkle repair (set_repair): FM clicks patched over, and badly hit lines kept from the last field
++  uint64_t clicks_repaired = 0, lines_kept = 0;
++  double line_us = 0;                     // tracked line period
++  float lock_recent = 0;                  // locked fraction over the last ~2 fields
++  bool colour = false;                    // colour is being decoded (burst present and steady)
++  float burst_err = 0;                    // mean burst phase error (rad)
++  const char *std_name = "?";
++};
++
++struct DecoderOpts {
++  int width = 720;
++  bool fields = true;          // true: every field, line-doubled (60/50 Hz, no combing); false: woven frames
++  int std_force = 0;           // 0 auto, 1 NTSC, 2 PAL
++  bool force_invert = false;   // only try sync at the high-frequency end
++  bool colour = true;          // decode colour (falls back to grey when there is no usable burst)
++  // AnalogRX: how colour is kept out of the picture's brightness (NTSC; PAL always uses the notch).
++  //  0 = classic: 3 MHz 4th-order low-pass + a notch at the subcarrier (rings ~4 px after every edge)
++  //  1 = comb: a gentle 4.8 MHz low-pass, colour cancelled with the line before (no ringing, sharper)
++  // -1 = from the environment, ARX_LUMA=classic|comb (default comb)
++  int luma_filter = -1;
++  LineSink lines;  // AnalogRX low latency: every line as it is drawn (on the decoding thread); empty = none
++};
++
++class Decoder;
++
++// AnalogRX: sparkle repair, for every decoder in the process (takes effect at once). The white / black
++// sparkles of a weak signal are FM "clicks": the carrier's envelope collapses and its phase slips a turn. The
++// front end marks those instants; the decoder, which draws each line about a line after it arrives, patches the
++// picture over each mark (a straight line between the good points either side; sync is left alone) and redraws
++// a badly hit line from the lines above and below it. Nothing is held back: no delay is added.
++void set_repair(bool on);
++bool repair_on();
++
++// AnalogRX: adaptive comb (NTSC comb mode), for every decoder in the process. The comb separates colour from
++// brightness by comparing each line with the one before; where that line is clearly different (OSD text,
++// horizons) it leaves a halo and false colour. There the brightness falls back to the notch filter and the
++// colour is faded out. Uses only the line before: no delay is added.
++void set_adaptive_comb(bool on);
++bool adaptive_comb_on();
++
++// AnalogRX: smooth lines (DecoderOpts::fields), for every decoder in the process. A field is every other line of
++// the picture; it used to be shown with each line twice (stair-stepped edges, and the two fields half a line
++// apart, so the picture shimmered up and down). On: each field's lines go in their own place and the lines
++// between are interpolated along edges (edge-based line averaging). Done as each field ends: no delay.
++void set_smooth_lines(bool on);
++bool smooth_lines_on();
++
++// IQ (at fs_in) -> DC removal -> NCO -> [halfband /2 when fs_in >= 40e6] -> FM discriminator -> Decoder.
++class FrontEnd {
++public:
++  FrontEnd(double fs_in, double shift_hz, FrameSink sink, const DecoderOpts &o = {});
++  ~FrontEnd();
++  void set_shift(double shift_hz);  // carrier offset from the stream centre (Hz) to bring to 0
++  double shift() const { return _shift; }
++  void feed(const cf *x, size_t n);  // demod + decode
++  // The two halves, for running them on two threads: demod() -> discriminator output (MHz at fs_demod),
++  // decode() -> frames. Each half is single-threaded.
++  // bad (optional, sparkle repair): per output sample, 1 = the carrier's envelope collapsed there (a click)
++  void demod(const cf *x, size_t n, std::vector<float> &out, std::vector<uint8_t> *bad = nullptr);
++  void decode(const float *d, size_t n, const uint8_t *bad = nullptr);
++  DecoderStats stats() const;
++  double fs_demod() const { return _fs_out; }
++  // AnalogRX async frames: true = whole pictures are built and handed to the FrameSink on a thread of their own,
++  // so the decoding thread goes straight on with the next lines (low latency). Call on the decoding thread.
++  void set_async_frames(bool on);
++
++private:
++  double _fs_in, _fs_out, _shift = 0;
++  bool _decimate;
++  static constexpr int kHb = 23;   // halfband taps
++  static constexpr int kTab = 4096;  // mixer table / chunk length
++  float _h[kHb];
++  std::vector<float> _tr, _ti;     // step^i, i < kTab
++  cf _stepN{1, 0}, _rot{1, 0}, _dc{}, _prev{1, 0};
++  std::vector<float> _wr, _wi;     // mixed samples with kHb-1 of history in front
++  std::vector<float> _yr, _yi;     // decimated
++  int _phase = 0;                  // start of the next halfband window in the next chunk (0 or 1)
++  std::vector<float> _dbuf;
++  Decoder *_dec;
++  std::vector<float> _env;  // sparkle repair: each output sample's envelope (power)
++  float _pref = 0;          // ... and its recent level
++};
++
++}  // namespace kp
+--- a/native/dsp/video.cpp
++++ b/native/dsp/video.cpp
+@@ -3,6 +3,9 @@
+ #include "video.h"
+ 
+ #include <atomic>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -73,6 +76,7 @@
+ 
+ // ---- the decoder (streaming, one sample of discriminator output at a time, MHz) ----------------------
+ class Decoder {
++  friend class FrontEnd;  // AnalogRX async frames
+ public:
+   Decoder(double fs, FrameSink sink, const DecoderOpts &o) : fs(fs), sink(std::move(sink)), o(o) {
+     luma_ring.assign(8192, 0);
+@@ -288,6 +292,15 @@
+   size_t acq_n = 0;
+   bool acquiring = true;
+   std::vector<uint8_t> fieldA, fieldB, frame;
++  // AnalogRX async frames: the frame thread and the picture waiting for it (see deliver())
++  bool async_frames = false;  // decoding thread
++  std::thread fw;
++  std::mutex fm;
++  std::condition_variable fcv;
++  std::vector<uint8_t> fp_a, fp_b;
++  int fp_kind = 0, fp_w = 0, fp_h = 0;
++  bool fp_upper = false, fp_have = false, f_quit = false;
++  const VideoStd *fp_std = nullptr;
+   bool haveA = false, haveB = false;
+   int cur_field = -1;
+   int64_t field_line0 = 0;
+@@ -605,6 +618,7 @@
+       row[x] = 0xff000000u | q(bl) << 16 | q(g) << 8 | q(r);  // bytes R, G, B, X
+     }
+     if (rep) mend_rows(k, hit);
++    if (o.lines) o.lines(Line{reinterpret_cast<const uint8_t *>(row), o.width, static_cast<int>(k), cur_field, std_->active, std_});
+   }
+ 
+   // AnalogRX sparkle repair: up to 3 badly hit rows in a row are redrawn from the good rows above and below
+@@ -630,6 +644,7 @@
+         uint8_t *dst = buf + static_cast<size_t>(r) * rowb;
+         for (size_t x = 0; x < rowb; x++) dst[x] = static_cast<uint8_t>((top[x] * wt + bot[x] * wb + span / 2) / span);
+         lines_kept++;
++        if (o.lines) o.lines(Line{dst, o.width, static_cast<int>(r), cur_field, std_->active, std_});  // AnalogRX low latency
+       }
+     }
+     bad_from = -1;
+@@ -692,20 +707,17 @@
+     thr = 0.5f * (tip + blank);
+     gated_lines++;
+   }
+-
+   // AnalogRX smooth lines: field f (the upper field when upper) into the frame at its own lines, the lines
+   // between from the field lines above (p) and below (q), averaged along whichever of 5 directions matches best
+   // (so a diagonal edge stays a clean diagonal instead of a staircase)
+-  void emit_field(const std::vector<uint8_t> &f, bool upper) {
+-    const int W = o.width, A = std_->active;
++  static void build_field(uint8_t *out, const uint8_t *f, bool upper, int W, int A) {
+     const size_t rowb = static_cast<size_t>(W) * 4;
+-    uint8_t *out = frame.data();
+-    for (int r = 0; r < A; r++) std::memcpy(out + (2 * r + (upper ? 0 : 1)) * rowb, f.data() + r * rowb, rowb);
++    for (int r = 0; r < A; r++) std::memcpy(out + (2 * r + (upper ? 0 : 1)) * rowb, f + r * rowb, rowb);
+     auto lum = [](const uint8_t *px) { return px[0] + 2 * px[1] + px[2]; };
+     for (int r = 0; r < A; r++) {
+       const int line = upper ? 2 * r + 1 : 2 * r;
+       const int rp = upper ? r : std::max(r - 1, 0), rq = upper ? std::min(r + 1, A - 1) : r;
+-      const uint8_t *p = f.data() + rp * rowb, *q = f.data() + rq * rowb;
++      const uint8_t *p = f + rp * rowb, *q = f + rq * rowb;
+       uint8_t *dst = out + line * rowb;
+       for (int x = 0; x < W; x++) {
+         int best = 0, bc = 1 << 30;
+@@ -719,20 +731,77 @@
+         for (int k = 0; k < 4; k++) dst[x * 4 + k] = static_cast<uint8_t>((a[k] + b[k] + 1) >> 1);
+       }
+     }
+-    frames_out++;
+-    if (sink) sink(Frame{frame.data(), o.width, 2 * std_->active, std_});
+   }
+ 
+-  void emit(const std::vector<uint8_t> &a, const std::vector<uint8_t> &b) {
+-    const size_t rowb = static_cast<size_t>(o.width) * 4;
+-    for (int r = 0; r < std_->active; r++) {
+-      std::memcpy(frame.data() + (2 * r) * rowb, a.data() + r * rowb, rowb);
+-      std::memcpy(frame.data() + (2 * r + 1) * rowb, b.data() + r * rowb, rowb);
++  static void build_pair(uint8_t *out, const uint8_t *a, const uint8_t *b, int W, int A) {
++    const size_t rowb = static_cast<size_t>(W) * 4;
++    for (int r = 0; r < A; r++) {
++      std::memcpy(out + (2 * r) * rowb, a + r * rowb, rowb);
++      std::memcpy(out + (2 * r + 1) * rowb, b + r * rowb, rowb);
+     }
++  }
++
++  // A finished picture to the sink: built here (the usual way), or (AnalogRX async frames, set_async_frames) the
++  // field(s) copied and handed to the frame thread, which builds the picture and calls the sink there, so this
++  // thread goes straight on drawing the next lines. kind: 0 = smooth field, 1 = field doubled, 2 = two fields woven.
++  void deliver(int kind, const std::vector<uint8_t> &a, const std::vector<uint8_t> &b, bool upper) {
+     frames_out++;
+-    if (sink) sink(Frame{frame.data(), o.width, 2 * std_->active, std_});
++    if (!sink) return;
++    const int W = o.width, A = std_->active;
++    if (!async_frames) {
++      if (kind == 0) build_field(frame.data(), a.data(), upper, W, A);
++      else build_pair(frame.data(), a.data(), b.data(), W, A);
++      sink(Frame{frame.data(), W, 2 * A, std_});
++      return;
++    }
++    if (!fw.joinable()) fw = std::thread([this] { frame_thread(); });
++    {
++      std::lock_guard<std::mutex> l(fm);
++      fp_a.assign(a.begin(), a.end());  // a busy frame thread: the newer picture replaces the waiting one
++      if (kind == 2) fp_b.assign(b.begin(), b.end());
++      fp_kind = kind;
++      fp_upper = upper;
++      fp_w = W;
++      fp_h = A;
++      fp_std = std_;
++      fp_have = true;
++    }
++    fcv.notify_one();
++  }
++
++  void frame_thread() {
++    std::vector<uint8_t> a, b, out;
++    for (;;) {
++      int kind, W, A;
++      bool upper;
++      const VideoStd *st;
++      {
++        std::unique_lock<std::mutex> l(fm);
++        fcv.wait(l, [&] { return fp_have || f_quit; });
++        if (f_quit) return;
++        fp_have = false;
++        a.swap(fp_a);
++        b.swap(fp_b);
++        kind = fp_kind, upper = fp_upper, W = fp_w, A = fp_h, st = fp_std;
++      }
++      out.resize(static_cast<size_t>(W) * 2 * A * 4);
++      if (kind == 0) build_field(out.data(), a.data(), upper, W, A);
++      else build_pair(out.data(), a.data(), kind == 2 ? b.data() : a.data(), W, A);
++      sink(Frame{out.data(), W, 2 * A, st});
++    }
+   }
+ 
++  void stop_frames() {
++    if (!fw.joinable()) return;
++    {
++      std::lock_guard<std::mutex> l(fm);
++      f_quit = true;
++    }
++    fcv.notify_one();
++    fw.join();
++  }
++
++
+   void close_line(double next_start) {
+     const bool vs = line_low > 0.5 * T;
+     if (vs && !prev_line_vsync && line_has_longrun) {
+@@ -742,14 +811,14 @@
+       const bool odd = std::fabs(ph) < 0.25;
+       if (cur_field == 0) {
+         haveA = true;
+-        if (o.fields) smooth_lines_on() ? emit_field(fieldA, false) : emit(fieldA, fieldA);  // A is the lower field (measured)
++        if (o.fields) deliver(smooth_lines_on() ? 0 : 1, fieldA, fieldA, false);  // A is the lower field (measured)
+       }
+       if (cur_field == 1) {
+         haveB = true;
+-        if (o.fields) smooth_lines_on() ? emit_field(fieldB, true) : emit(fieldB, fieldB);
++        if (o.fields) deliver(smooth_lines_on() ? 0 : 1, fieldB, fieldB, true);
+       }
+       if (!o.fields && haveA && haveB) {
+-        emit(fieldA, fieldB);
++        deliver(2, fieldA, fieldB, false);
+         haveA = haveB = false;
+       }
+       cur_field = odd ? 0 : 1;
+@@ -814,7 +883,12 @@
+   set_shift(shift_hz);
+ }
+ 
+-FrontEnd::~FrontEnd() { delete _dec; }
++FrontEnd::~FrontEnd() {
++  _dec->stop_frames();  // AnalogRX async frames
++  delete _dec;
++}
++
++void FrontEnd::set_async_frames(bool on) { _dec->async_frames = on; }
+ 
+ void FrontEnd::set_shift(double s) {
+   _shift = s;

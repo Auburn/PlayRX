@@ -3,7 +3,8 @@ Play RX
 
 Play RX receives analog 5.8 GHz FPV video with RTL8812BU USB Wi-Fi adapters used as
 software-defined radios, and serves each feed's video to the app window, to OBS, to FPV
-Trackside and as Windows cameras.
+Trackside and (on Windows) as cameras for other programs. It shows live video only and
+does not record.
 
 Licence
 -------
@@ -27,17 +28,20 @@ Built with
 - winpthreads (MinGW-w64 runtime) - MIT-style (licenses\winpthreads.txt)
 - libwdi (driver setup, driver\wdi-simple.exe) - LGPL-3.0 (licenses\LGPL-3.0-libwdi.txt); it carries
   Microsoft's WinUSB / WDF co-installers from the Windows Driver Kit 8 redistributable components
-- webview (window) - MIT; uses the Microsoft Edge WebView2 Runtime, part of Windows
+- webview (window) - MIT; uses the Microsoft Edge WebView2 Runtime on Windows, WKWebView
+  on macOS
+- libjpeg-turbo (macOS, Linux) - IJG / BSD-style
 
 Firmware
 --------
 devourer includes Realtek's firmware for the RTL8822B chip (hal/hal8822b_fw.c), which is
-built into PlayRX.exe and loaded onto the adapter. It belongs to Realtek, is not covered by
+built into the Play RX program and loaded onto the adapter. It belongs to Realtek, is not covered by
 the GPL, and is distributed as devourer distributes it.
 
 Your data
 ---------
-Settings, feeds and adapter names are kept in %APPDATA%\Play RX; recordings in
-Videos\Play RX unless another folder is chosen. Uninstalling leaves them in place.
+Settings, feeds and adapter names are kept in %APPDATA%\Play RX (Windows),
+~/Library/Application Support/Play RX (macOS) or ~/.local/share/play-rx (Linux).
+Uninstalling leaves them in place.
 
-Not affiliated with Realtek, TP-Link, Cudy, OBS or FPV Trackside.
+Not affiliated with Realtek, TP-Link, Cudy, Apple, OBS or FPV Trackside.
